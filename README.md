@@ -1,6 +1,12 @@
 # Conditonal DDPM for Text-to-Medical-Images-Synthesis
 
-## 0. Environment Setup
+## 0. Pre-requiste
+
+* NVIDIA GPU with CUDA support (recommended: at least 16GB VRAM)
+* CUDA Toolkit (12.1 recommended)
+* Python 3.12
+
+## 1. Environment Setup
 
 1. Create a virtual environment
 
@@ -23,7 +29,7 @@
     pip install -e .
     ```
 
-## 1. Dataset Download
+## 2. Dataset Download
   * Access the Indiana University Chest X-ray Collection from [Open-i](https://openi.nlm.nih.gov/faq).
   * For this project, you must use both the `PNG images` and `Reports` of the dataset.
   * Organize the data with following directory structure:
@@ -35,13 +41,13 @@
         /Reports         # Contains corresponding medical reports
     ```
 
-## 2. Training
+## 3. Training
 
 1. Navigate to the `train.py` and modify the hyperparameters in the `Config` class based on your settings.
 2. Start the training process with the following command
    ```python3 train.py```
 
-## 3.  Inference with Pre-trained Models
+## 4.  Inference with Pre-trained Models
 
 1. Download pre-trained weights from [Google Drive](https://drive.google.com/file/d/1CZSjKLUYmv8malavn2qfcxEKy_ZH_DgG/view?usp=drive_link).
 2. Save the checkpoint file.
