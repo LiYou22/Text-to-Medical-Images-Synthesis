@@ -18,7 +18,10 @@
   * Clone the repository and put it in the root path of the project directory
   * In `/open_clip/src/open_clip/model.py`, change the `output_tokens` attribute of class `CLIPTextCfg` to `True`. This way, the text encoder will return embeddings of tokens rather than a globally-pooled embedding.
   * Then run the command:
-    ```pip install -e .```
+    ```
+    cd open_clip
+    pip install -e .
+    ```
 
 ## 1. Dataset Download
   * Access the Indiana University Chest X-ray Collection from [Open-i](https://openi.nlm.nih.gov/faq).
