@@ -37,5 +37,6 @@
 
 1. Download our pre-trained model weights from [Google Drive](https://drive.google.com/file/d/1CZSjKLUYmv8malavn2qfcxEKy_ZH_DgG/view?usp=drive_link).
 2. Save the checkpoint file.
-3. Generate medical images from text descriptions using the following command:
+3. Generate medical images from text descriptions using the following command:  
+   
    ```python inference.py --checkpoint </path/to/your/checkpoint.pt> --caption <caption> --output <img.png> --n_steps <n_steps> --seed <seed>```
