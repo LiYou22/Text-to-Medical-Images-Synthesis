@@ -51,7 +51,7 @@
 ## 4. Inference with Pre-trained Models
 
 1. Download pre-trained weights from [Google Drive](https://drive.google.com/file/d/1CZSjKLUYmv8malavn2qfcxEKy_ZH_DgG/view?usp=drive_link).
-2. Save the checkpoint file.
+2. Save the checkpoint file under `/results` directory.
 3. Generate medical images from text descriptions using the following command:  
    
    ```python inference.py --checkpoint </path/to/your/checkpoint.pt> --caption <caption> --output <img.png> --n_steps <n_steps> --seed <seed>```
