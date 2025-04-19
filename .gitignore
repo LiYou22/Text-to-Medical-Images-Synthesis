@@ -174,7 +174,8 @@ cython_debug/
 .pypirc
 
 # Project directory
+open_clip/
 data/
 results/
-
+results-1/
 

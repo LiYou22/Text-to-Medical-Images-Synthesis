@@ -3,7 +3,6 @@ import torch
 import numpy as np
 import argparse
 from pathlib import Path
-from torchvision.utils import save_image
 import matplotlib.pyplot as plt
 
 from models.clip_encoder import CLIPEncoder
@@ -17,23 +16,25 @@ class Config:
     
     # Text encoder
     model_name = "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-    max_length = 77
+    max_length = 128
     use_projection = True
     diffusion_dim = 512
 
     # UNet
     channels = 1
-    use_cross_attention=True
-    use_self_attention=True
+    self_condition=False
     use_linear_attention=True
+    use_cross_attention=True
     
     # Diffusion trainer
-    results_folder = "./inference_results"
+    results_folder = "./results"
     batch_size = 1
-    timesteps = 300
-    beta_schedule = 'cosine'
+    timesteps = 1000
+    beta_schedule = "cosine"
     image_size = 256
     n_steps = 1000
+    scheduler_type = "cosine"
+    scheduler_params = {"T_max": 50, "eta_min": 5e-6} 
 
 
 def set_seed(seed):
@@ -45,17 +46,33 @@ def set_seed(seed):
 
 
 def save_with_caption(image_tensor, caption, output_path):
-    image = (image_tensor + 1) * 0.5
-    image = image.squeeze().cpu().numpy()
+    # [-1, 1] -> [0, 255]
+    gen_image = ((image_tensor + 1) * 0.5 * 255).clamp(0, 255)
+    gen_image = gen_image.squeeze().cpu().numpy().astype(np.uint8)
     
-    plt.figure(figsize=(10, 12))
-    plt.imshow(image, cmap='gray')
+    plt.figure(figsize=(8, 10))
+    
+    # Generared
+    if len(gen_image.shape) == 3 and gen_image.shape[0] in [1, 3]:
+        if gen_image.shape[0] == 1:
+            plt.imshow(gen_image[0], cmap='gray')
+        else:
+            plt.imshow(np.transpose(gen_image, (1, 2, 0)))
+    else:
+        plt.imshow(gen_image, cmap='gray')
+    
     plt.axis('off')
-    plt.title(caption, fontsize=12, wrap=True)
-    plt.tight_layout()
     
+    # Caption
+    caption = caption if len(caption) <= 100 else caption[:100] + "..."
+    plt.title(f"Caption: {caption}", fontsize=12, wrap=True)
+    
+    plt.tight_layout()
     plt.savefig(output_path, bbox_inches='tight', pad_inches=0.1, dpi=300)
     plt.close()
+    
+    print(f"Generated image saved to {output_path}")
+    return output_path
 
 
 def main():
@@ -66,7 +83,6 @@ def main():
     parser.add_argument("--n_steps", type=int, default=Config.n_steps, help="Number of sampling steps.")
     parser.add_argument("--seed", type=int, default=Config.seed, help="Random seed for reproducibility.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for generating multiple images from same prompt.")
-    parser.add_argument("--create-animation", action="store_true", help="Create an animation of the diffusion process")
     
     args = parser.parse_args()
     
@@ -80,14 +96,14 @@ def main():
     results_folder.mkdir(exist_ok=True)
     
     output_path = Path(args.output)
-    if output_path.suffix.lower() not in ['.png', '.jpg', '.jpeg']:
+    if output_path.suffix.lower() not in ['.png']:
         output_path = output_path.with_suffix('.png')
     
     print(f"Initializing text encoder with {Config.model_name}...")
     text_encoder = CLIPEncoder(
         model_name=Config.model_name, 
         max_length=Config.max_length, 
-        embedding_dim=None,
+        diffusion_dim=Config.diffusion_dim,
         use_projection=Config.use_projection
     )
     
@@ -100,14 +116,14 @@ def main():
         dim_mults=(1, 2, 4, 8),
         channels=Config.channels,
         context_dim=context_dim,
-        self_condition=Config.use_self_attention,
+        self_condition=Config.self_condition,
         use_linear_attn=Config.use_linear_attention,
-        cross_condition=Config.use_cross_attention
+        use_cross_attention=Config.use_cross_attention
     )
     
     trainer = DiffusionTrainer(
         model=unet,
-        dataset=None,
+        dataloader=None,
         text_encoder=text_encoder,
         timesteps=Config.timesteps,
         beta_schedule=Config.beta_schedule,
@@ -116,7 +132,9 @@ def main():
         batch_size=Config.batch_size,
         lr=0,
         device=Config.device,
-        results_folder=Config.results_folder
+        results_folder=Config.results_folder,
+        scheduler_type=Config.scheduler_type,
+        scheduler_params=Config.scheduler_params
     )
     
     print(f"Loading model from checkpoint: {args.checkpoint}")
@@ -141,43 +159,14 @@ def main():
         )
     
     if Config.batch_size == 1:
-        if output_path.suffix.lower() in ['.png', '.jpg', '.jpeg']:
-            save_image((generated_images + 1) / 2, output_path)
-            print(f"Generated image saved to {output_path}")
-
-            caption_path = output_path.with_stem(f"{output_path.stem}_with_caption")
-            save_with_caption(generated_images[0], args.caption, caption_path)
-            print(f"Generated image with caption saved to {caption_path}")
+        save_with_caption(generated_images[0], args.caption, output_path)
     else:
-        grid_path = output_path.with_stem(f"{output_path.stem}_grid")
-        save_image((generated_images + 1) / 2, grid_path, nrow=int(Config.batch_size**0.5))
-        print(f"Grid of generated images saved to {grid_path}")
-        
         for i in range(Config.batch_size):
             img_path = output_path.with_stem(f"{output_path.stem}_{i+1}")
-            save_image((generated_images[i] + 1) / 2, img_path)
-            
-            caption_path = img_path.with_stem(f"{img_path.stem}_with_caption")
-            save_with_caption(generated_images[i], args.caption, caption_path)
+            save_with_caption(generated_images[i], args.caption, img_path)
         
         print(f"Individual images saved with prefix {output_path.stem}")
 
-    if args.create_animation:
-        print("Creating animation of the diffusion process...")
-        with torch.no_grad():
-            context = trainer.encode_text([args.caption])
-            samples = trainer.p_sample_loop(
-                shape=(1, Config.channels, Config.image_size, Config.image_size),
-                context=context,
-                n_steps=Config.n_steps
-            )
-            
-            animation_path = output_path.with_stem(f"{output_path.stem}_animation")
-            trainer.create_animation(
-                samples=samples,
-                save_path=str(animation_path.with_suffix('.gif'))
-            )
-            print(f"Animation saved to {animation_path.with_suffix('.gif')}")
 
 if __name__ == "__main__":
     main()

@@ -17,32 +17,32 @@ class Config:
     
     # Encoder
     model_name = "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-    max_length = 77
+    max_length = 128
     use_projection = True
     diffusion_dim = 512
     
     # Unet
     channels = 1
-    self_condition=True
+    self_condition=False
     use_linear_attention=True
     use_cross_attention=True
     
     # Diffusion Trainer
     image_size = 256
     batch_size = 8
-    epochs = 50
-    lr = 5e-5
+    epochs = 30
+    lr = 2e-5
     timesteps = 1000
     beta_schedule = 'cosine'
     results_folder = "./results"
-    loss_type = "huber"
+    loss_type = "l2"
     scheduler_type = "cosine"
-    scheduler_params = {"T_max": 100, "eta_min": 1e-6}
+    scheduler_params = {"T_max": 30, "eta_min": 2e-6}
+    n_steps = 1000
     
-    split_ratio = 0.9
+    split_ratio = 0.99
     max_samples = None
 
-    grad_clip_value=1.0
     save_model_every_epoch=True
 
 
@@ -95,7 +95,6 @@ def main():
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Validation dataset size: {len(val_dataset)}")
     
-
     train_dataloader = DataLoader(
         train_dataset, 
         batch_size=Config.batch_size, 
@@ -117,7 +116,7 @@ def main():
     text_encoder = CLIPEncoder(
         model_name=Config.model_name, 
         max_length=Config.max_length, 
-        embedding_dim=None,
+        diffusion_dim=Config.diffusion_dim,
         use_projection=Config.use_projection
     )
     
@@ -127,7 +126,6 @@ def main():
     print("Initializing conditional UNet model...")
     unet = Unet(
         dim=64,
-        init_dim=64,
         dim_mults=(1, 2, 4, 8),
         channels=Config.channels,
         context_dim=context_dim,
@@ -142,7 +140,7 @@ def main():
     print("Initializing diffusion trainer...")
     trainer = DiffusionTrainer(
         model=unet,
-        dataset=train_dataloader,
+        dataloader=train_dataloader,
         text_encoder=text_encoder,
         timesteps=Config.timesteps,
         beta_schedule=Config.beta_schedule,
@@ -171,7 +169,7 @@ def main():
         epochs=Config.epochs,
         start_epoch=start_epoch,
         val_loader=val_dataloader,
-        grad_clip_value=Config.grad_clip_value,
+        n_steps = Config.n_steps,
         save_model_every_epoch=Config.save_model_every_epoch
     )
     

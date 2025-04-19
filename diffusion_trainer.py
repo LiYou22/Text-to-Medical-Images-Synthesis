@@ -7,8 +7,6 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR
-from torch.nn.utils import clip_grad_norm_
-from torch import autocast, GradScaler
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
@@ -76,7 +74,7 @@ class DiffusionTrainer:
     def __init__(
         self,
         model,
-        dataset,
+        dataloader,
         text_encoder=None,
         timesteps=1000,
         beta_schedule='cosine',
@@ -88,10 +86,10 @@ class DiffusionTrainer:
         results_folder="./results",
         loss_type="huber",
         scheduler_type="step",
-        scheduler_params = {"T_max": 100, "eta_min": 5e-6}
+        scheduler_params = None
     ):
         self.model = model
-        self.dataset = dataset
+        self.dataloader = dataloader
         self.text_encoder = text_encoder 
         self.timesteps = timesteps
         self.image_size = image_size
@@ -102,7 +100,6 @@ class DiffusionTrainer:
         # Setup device
         self.device = device if device is not None else "cuda" if torch.cuda.is_available() else "cpu"
         self.model.to(self.device)
-        self.scaler = GradScaler(device)
 
         if self.text_encoder is not None:
             self.text_encoder.to(self.device)
@@ -118,13 +115,13 @@ class DiffusionTrainer:
         self.optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
         # Set up learning rate scheduler
-        if scheduler_type == "step":
+        if scheduler_type == "step" and scheduler_params != None:
             self.scheduler = StepLR(
                 self.optimizer, 
                 step_size=scheduler_params.get("step_size", 5), 
                 gamma=scheduler_params.get("gamma", 0.9)
             )
-        elif scheduler_type == "cosine":
+        elif scheduler_type == "cosine" and scheduler_params != None:
             self.scheduler = CosineAnnealingLR(
                 self.optimizer,
                 T_max=scheduler_params.get("T_max", 100),
@@ -173,10 +170,7 @@ class DiffusionTrainer:
         self.sqrt_recip_alphas = torch.sqrt(1.0 / self.alphas)
         
         # Posterior variance
-        self.posterior_variance = self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
-        self.posterior_log_variance_clipped = torch.log(torch.cat([self.posterior_variance[1:2], self.posterior_variance[1:]]))
-        self.posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
-        self.posterior_mean_coef2 = (1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod)
+        self.posterior_variance = (self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)).clamp_min(1e-20)
 
     def q_sample(self, x_start, t, noise=None):
         """Forward diffusion process"""
@@ -184,10 +178,7 @@ class DiffusionTrainer:
             noise = torch.randn_like(x_start, device=self.device)
             
         sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
-        sqrt_one_minus_alphas_cumprod_t = extract(
-            self.sqrt_one_minus_alphas_cumprod, t, x_start.shape
-        )
-
+        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
         x_noisy = sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
         
         return x_noisy, noise
@@ -212,26 +203,21 @@ class DiffusionTrainer:
 
         # Predict noise
         if getattr(self.model, 'self_condition', False) is True:
+            with torch.no_grad(): 
+                if getattr(self.model, 'use_cross_attention', False) and (context is not None):
+                    predicted_noise_1 = self.model(x_noisy, t, context=context)
+                else:
+                    predicted_noise_1 = self.model(x_noisy, t)
+            
             if getattr(self.model, 'use_cross_attention', False) and (context is not None):
-                predicted_noise_1 = self.model(x_noisy, t, context=context)
-            else:
-                predicted_noise_1 = self.model(x_noisy, t)
-
-            if getattr(self.model, 'use_cross_attention', False) and (context is not None):
-                predicted_noise_2 = self.model(
+                predicted_noise = self.model(
                     x_noisy,
                     t,
                     context=context,
                     x_self_cond=predicted_noise_1
                 )
             else:
-                predicted_noise_2 = self.model(
-                    x_noisy,
-                    t,
-                    x_self_cond=predicted_noise_1
-                )
-
-            predicted_noise = predicted_noise_2
+                predicted_noise = self.model(x_noisy, t, x_self_cond=predicted_noise_1)
 
         else:
             if getattr(self.model, 'use_cross_attention', False) and (context is not None):
@@ -280,37 +266,30 @@ class DiffusionTrainer:
         
         return x_noisy, predicted_noise, noise, loss.item()
 
-    def _get_model_prediction(self, x, t, context=None):
-        """Get model's noise prediction"""
-        if hasattr(self.model, 'use_cross_attention') and self.model.use_cross_attention and context is not None:
+    @torch.no_grad()
+    def _predict_eps(self, x, t, context=None):
+        if getattr(self.model, "use_cross_attention", False) and context is not None:
             return self.model(x, t, context=context)
-        else:
-            return self.model(x, t)
+        return self.model(x, t)
         
     @torch.no_grad()
     def p_sample(self, x, t, t_index, context=None):
         """Single step of DDPM sampling"""
         betas_t = extract(self.betas, t, x.shape)
-        sqrt_one_minus_alphas_cumprod_t = extract(
-            self.sqrt_one_minus_alphas_cumprod, t, x.shape
-        )
+        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
         sqrt_recip_alphas_t = extract(self.sqrt_recip_alphas, t, x.shape)
-        
-        # Predict noise
-        model_output = self._get_model_prediction(x, t, context)
 
-        # Calculate mean
-        model_mean = sqrt_recip_alphas_t * (
-            x - betas_t * model_output / sqrt_one_minus_alphas_cumprod_t
-        )
-        
-        # No noise for last step
+        eps = self._predict_eps(x, t, context)
+        model_mean = sqrt_recip_alphas_t * (x - betas_t * eps / sqrt_one_minus_alphas_cumprod_t)
+
         if t_index == 0:
             return model_mean
-        else:
-            posterior_variance_t = extract(self.posterior_variance, t, x.shape)
-            noise = torch.randn_like(x, device=self.device)
-            return model_mean + torch.sqrt(posterior_variance_t) * noise
+        noise = torch.randn_like(x)
+        variance = extract(self.posterior_variance, t, x.shape)
+
+        #return model_mean + torch.sqrt(variance) * noise
+        result = model_mean + torch.sqrt(variance) * noise
+        return torch.clamp(result, min=-1.0, max=1.0)    # -> [-1, 1] 
 
     @torch.no_grad()
     def p_sample_loop(self, shape, context=None, n_steps=None, show_progress=True):
@@ -333,83 +312,33 @@ class DiffusionTrainer:
         else:
             iterator = range(len(timesteps))
     
-        with autocast(self.device):
-            for i in iterator:
-                t_index = len(timesteps) - i - 1
-                t = torch.full((b,), timesteps[t_index], device=device, dtype=torch.long)
-                img = self.p_sample(img, t, t_index, context)
-                imgs.append(img.cpu().detach())
-            
+        for i in iterator:
+            t_index = len(timesteps) - i - 1
+            t = torch.full((b,), timesteps[t_index], device=device, dtype=torch.long)
+            img = self.p_sample(img, t, t_index, context)
+            imgs.append(img.cpu().detach())
+
         return imgs
 
     @torch.no_grad()
-    def ddim_sample_loop(self, shape, context=None, n_steps=50, eta=0.0, show_progress=True):
-        device = self.device
-        b = shape[0]
-        timesteps = np.linspace(self.timesteps - 1, 0, n_steps).round().astype(int)
-    
-        x = torch.randn(shape, device=device)
-        imgs = [x.cpu().detach()]
-        
-        iterator = tqdm(timesteps[:-1], desc='DDIM sampling') if show_progress else timesteps[:-1]
-        
-        for i, timestep in enumerate(iterator):
-            t = torch.full((b,), timestep, device=device, dtype=torch.long)
-            next_t = torch.full((b,), timesteps[i+1], device=device, dtype=torch.long)
-            
-            alpha_t = extract(self.alphas_cumprod, t, x.shape)
-            alpha_next = extract(self.alphas_cumprod, next_t, x.shape)
-            
-            pred_noise = self._get_model_prediction(x, t, context=context)
-            
-            sqrt_alpha_t = torch.sqrt(alpha_t)
-            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
-            x0_pred = (x - sqrt_one_minus_alpha_t * pred_noise) / sqrt_alpha_t
-            
-            sigma_t = eta * torch.sqrt((1 - alpha_next/alpha_t) * (1 - alpha_t))
-            
-            sqrt_alpha_next = torch.sqrt(alpha_next)
-            direction_term = torch.sqrt(1 - alpha_next - sigma_t**2) * pred_noise
-            
-            noise = torch.randn_like(x) if eta > 0 else 0.0
-            random_term = sigma_t * noise
-            
-            x = sqrt_alpha_next * x0_pred + direction_term + random_term
-            imgs.append(x.cpu().detach())
-        
-        return imgs
-
-
-    @torch.no_grad()
-    def sample(self, batch_size=32, captions=None, context=None, n_steps=None, method="ddpm", ddim_eta=0.0, show_progress=True):
+    def sample(self, batch_size=32, captions=None, context=None, n_steps=None, show_progress=True):
         """Method for generating samples"""
         image_shape = (batch_size, self.channels, self.image_size, self.image_size)
 
         if captions is not None and context is None and self.text_encoder is not None:
             context = self.encode_text(captions)
 
-        if method == "ddpm":
-            samples = self.p_sample_loop(
-                shape=image_shape, 
-                context=context, 
-                n_steps=n_steps,
-                show_progress=show_progress
-            )
-        elif method == "ddim":
-            if n_steps is None:
-                n_steps = min(self.timesteps // 10, 100)        
-            samples = self.ddim_sample_loop(
-                shape=image_shape,
-                context=context,
-                n_steps=n_steps,
-                eta=ddim_eta,
-                show_progress=show_progress
-            )
+        samples = self.p_sample_loop(
+            shape=image_shape, 
+            context=context, 
+            n_steps=n_steps,
+            show_progress=show_progress
+        )
 
         return samples[-1]
     
     @torch.no_grad()
-    def sample_from_text(self, text, batch_size=1, n_steps=None, method="ddpm", ddim_eta=0.0, show_progress=True):
+    def sample_from_text(self, text, batch_size=1, n_steps=None, show_progress=True):
         if isinstance(text, str):
             text = [text] * batch_size
         elif len(text) == 1 and batch_size > 1:
@@ -424,18 +353,14 @@ class DiffusionTrainer:
             batch_size=batch_size, 
             context=context, 
             n_steps=n_steps,
-            method=method,
-            ddim_eta=ddim_eta,
             show_progress=show_progress
         )
         
-    def compute_metrics(self, original, generated):
-        # Ensure inputs are in [0, 255] range
-        if original.min() < 0:
-            original = (original + 1) / 2 * 255
-        if generated.min() < 0:
-            generated = (generated + 1) / 2 * 255
-        
+    def compute_metrics(self, original, generated):       
+        # to [0, 1]
+        generated = (generated + 1) / 2
+        original  = (original  + 1) / 2 
+
         # Initialize metrics
         psnr_metric = PeakSignalNoiseRatio().to(self.device)
         ssim_metric = StructuralSimilarityIndexMeasure().to(self.device)
@@ -452,7 +377,7 @@ class DiffusionTrainer:
 
         return {"psnr": psnr_val, "ssim": ssim_val}
 
-    def validate(self, val_loader, context=None, method="ddpm", n_steps=200, ddim_eta=0.0):
+    def validate(self, val_loader, n_steps=200):
         self.model.eval()
         total_loss = 0
         total_psnr = 0
@@ -460,17 +385,9 @@ class DiffusionTrainer:
         batch_count = 0
 
         for batch in tqdm(val_loader, desc="Validation"):
-            if isinstance(batch, dict):
-                x = batch["pixel_values"].to(self.device)
-
-                if context is None and "caption" in batch and self.text_encoder is not None:
-                    captions = batch["caption"]
-                    batch_context = self.encode_text(captions)
-                else:
-                    batch_context = context
-            else:
-                x = batch.to(self.device)
-                batch_context = context
+            x = batch["pixel_values"].to(self.device)      
+            captions = batch["caption"]
+            batch_context = self.encode_text(captions)
         
             batch_size = x.shape[0]
 
@@ -483,8 +400,6 @@ class DiffusionTrainer:
                     batch_size=batch_size, 
                     context=batch_context, 
                     n_steps=n_steps, 
-                    method=method,
-                    ddim_eta=ddim_eta,
                     show_progress=False
                 )
                 metrics = self.compute_metrics(x, generated)
@@ -504,15 +419,15 @@ class DiffusionTrainer:
         self.history["val_psnr"].append(avg_psnr)
         self.history["val_ssim"].append(avg_ssim)
         
-        self.model.train()
         return {"loss": avg_loss, "psnr": avg_psnr, "ssim": avg_ssim}
     
-    def train(self, epochs, start_epoch=0, val_loader=None, grad_clip_value=1.0, method="ddpm", n_steps=50, ddim_eta=0.0, save_model_every_epoch=True):
+    def train(self, epochs, start_epoch=0, val_loader=None, n_steps=200, save_model_every_epoch=True):
         for epoch in range(start_epoch, epochs):
+            self.model.train()
             epoch_loss = 0.0
             batch_count = 0
             
-            for step, batch in enumerate(tqdm(self.dataset, desc=f"Epoch {epoch+1}/{epochs}")):
+            for step, batch in enumerate(tqdm(self.dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
                 if isinstance(batch, dict):
                     x = batch["pixel_values"].to(self.device)
                     
@@ -530,16 +445,10 @@ class DiffusionTrainer:
                 
                 # Compute loss
                 self.optimizer.zero_grad()
-                with autocast(self.device): 
-                    loss = self.p_losses(x, t, context=context)
-                
-                self.scaler.scale(loss).backward()
-                
-                self.scaler.unscale_(self.optimizer)
-                clip_grad_norm_(self.model.parameters(), grad_clip_value)
-                
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                loss = self.p_losses(x, t, context=context)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                self.optimizer.step()
                 
                 epoch_loss += loss.item()
                 batch_count += 1
@@ -556,7 +465,7 @@ class DiffusionTrainer:
             
             # Validation
             if val_loader is not None:
-                val_metrics = self.validate(val_loader, method=method, n_steps=n_steps, ddim_eta=0.0)
+                val_metrics = self.validate(val_loader, n_steps)
                 print(f"Validation - Loss: {val_metrics['loss']:.6f}, PSNR: {val_metrics['psnr']:.2f}, SSIM: {val_metrics['ssim']:.4f}")
             
             # Visualization
@@ -567,9 +476,7 @@ class DiffusionTrainer:
                     real_images=val_batch["pixel_values"],
                     captions=val_batch["caption"],
                     batch_size=8,
-                    n_steps=n_steps,
-                    method=method,
-                    ddim_eta=ddim_eta
+                    n_steps=n_steps
                 )
                 print(f"Saved {len(sample_paths)} visualization")
 
@@ -577,60 +484,55 @@ class DiffusionTrainer:
             if save_model_every_epoch:
                 self.save_model(f"model-epoch-{epoch+1}.pt")
 
-    def visualize_samples(self, epoch, real_images, captions, batch_size=8, n_steps=200, method="ddpm", ddim_eta=0.0):
-        visualization_dir = self.results_folder / 'visualization' / f'epoch-{epoch}'
-        visualization_dir.mkdir(exist_ok=True, parents=True)
+    def visualize_samples(self, epoch, real_images, captions, batch_size=8, n_steps=1000):
+        vis_dir = self.results_folder / 'visualization' / f'epoch-{epoch}'
+        vis_dir.mkdir(exist_ok=True, parents=True)
         
         sample_size = min(batch_size, len(real_images))
-        sample_images = real_images[:sample_size].to(self.device)
-        sample_captions = captions[:sample_size]
+        real = real_images[:sample_size].to(self.device)
+        caps = captions[:sample_size]
         
-        sample_context = self.encode_text(sample_captions)
-        generated_images = self.sample(
-            batch_size=sample_size, 
-            context=sample_context, 
-            n_steps=n_steps, 
-            method=method,
-            ddim_eta=ddim_eta,
-            show_progress=True
-        )
-        
-        if sample_images.min() < 0: sample_images = (sample_images + 1) / 2 * 255
-        if generated_images.min() < 0: generated_images = (generated_images + 1) / 2 * 255
-        
-        saved_paths = []
-        
-        for i in range(sample_size):
-            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-            
-            # Original
-            real_img = sample_images[i].cpu().numpy()
-            axes[0].imshow(real_img[0] if real_img.shape[0] == 1 else np.transpose(real_img, (1, 2, 0)), cmap='gray')
-            axes[0].set_title("Ground Truth", fontsize=12)
-            axes[0].set_xticks([])
-            axes[0].set_yticks([])
+        ctx = self.encode_text(caps)
+        gen = self.sample(batch_size=sample_size, context=ctx, n_steps=n_steps)
 
-            # Genertaed
-            gen_img = generated_images[i].cpu().numpy()
-            axes[1].imshow(gen_img[0] if gen_img.shape[0] == 1 else np.transpose(gen_img, (1, 2, 0)), cmap='gray')
-            axes[1].set_title("Generated", fontsize=12)
-            axes[1].set_xticks([])
-            axes[1].set_yticks([])
+        print(f"Real: min={real.min().item():.4f}, max={real.max().item():.4f}, mean={real.mean().item():.4f}")
+        print(f"Generated: min={gen.min().item():.4f}, max={gen.max().item():.4f}, mean={gen.mean().item():.4f}")
+        
+        saved = []
+        for i in range(sample_size):
+            fig, axes = plt.subplots(1, 2, figsize=(10,5))
+                
+            # Real
+            img_r = real[i].cpu().numpy()
+            if img_r.shape[0] == 1:
+                axes[0].imshow(img_r[0], cmap='gray')
+            else:
+                axes[0].imshow(np.transpose(img_r, (1,2,0)))
+            axes[0].set_title("Ground Truth")
+            axes[0].axis('off')
             
+            # Generated
+            img_g = gen[i].cpu().numpy()
+            if img_g.shape[0] == 1:
+                axes[1].imshow(img_g[0], cmap='gray')
+            else:
+                axes[1].imshow(np.transpose(img_g, (1,2,0)))
+            axes[1].set_title("Generated")
+            axes[1].axis('off')
+                
             # Caption
-            caption_text = sample_captions[i][:100] + "..." if len(sample_captions[i]) > 100 else sample_captions[i]
-            plt.suptitle(f"Caption: {caption_text}", fontsize=10)
-            
+            cap = caps[i]
+            cap = cap if len(cap) <= 100 else cap[:100] + "..."
+            plt.suptitle(f"Caption: {cap}", fontsize=10)
             plt.tight_layout()
             
-            sample_path = str(visualization_dir / f'sample-{i+1}.png')
-            plt.savefig(sample_path, dpi=150, bbox_inches='tight')
+            path = vis_dir / f"sample-{i+1}.png"
+            plt.savefig(path, dpi=150, bbox_inches='tight')
             plt.close(fig)
+            saved.append(str(path))
             
-            saved_paths.append(sample_path)
-
-        return saved_paths
-        
+        return saved
+            
     def save_model(self, filename, epoch=None):
         save_path = self.results_folder / 'checkpoints'
 
@@ -696,31 +598,3 @@ class DiffusionTrainer:
         plt.tight_layout()
         plt.savefig(str(self.results_folder / 'plots' /'metrics_plot.png'))
         plt.close()
-
-    def create_animation(self, samples, index=0, interval=50, save_path=None):
-        if isinstance(samples, list) and isinstance(samples[0], torch.Tensor):
-            samples = [s[index].cpu().numpy() for s in samples]
-        
-        fig = plt.figure()
-        ims = []
-
-        for i in range(len(samples)):
-            sample = samples[i]
-            if sample.shape[0] == 1:
-                im = plt.imshow(sample.reshape(self.image_size, self.image_size), 
-                                cmap="gray", animated=True)
-            else:
-                im = plt.imshow(sample.transpose(1, 2, 0), animated=True)
-            ims.append([im])
-            
-        animate = animation.ArtistAnimation(fig, ims, interval=interval, 
-                                            blit=True, repeat_delay=1000)
-        
-        if save_path:
-            animate.save(save_path)
-            
-        plt.close()
-        
-        return animate
-    
-            

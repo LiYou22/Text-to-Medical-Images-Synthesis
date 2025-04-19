@@ -2,7 +2,6 @@
 # Reference: https://huggingface.co/microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224
 ############################################################################################
 
-
 import torch
 import torch.nn as nn
 from open_clip import create_model_from_pretrained, get_tokenizer
@@ -16,35 +15,37 @@ class CLIPEncoder(nn.Module):
     def __init__(
         self,
         model_name: str = "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
-        max_length: int = 77,
+        max_length: int = 128,
         embedding_dim: Optional[int] = None,
+        diffusion_dim: Optional[int] = None,
         use_projection: bool = True
     ):
         super().__init__()
         self.model, _ = create_model_from_pretrained(f'hf-hub:{model_name}')
         self.tokenizer = get_tokenizer(f'hf-hub:{model_name}')
         self.max_length = max_length
+        self.diffusion_dim = diffusion_dim
 
+        # Do not fine-tune for now
         for param in self.model.parameters():
             param.requires_grad = False
 
-        # Get embedding dimension if not provided
+        # If embedding dimension not provided, detect it manually
         if embedding_dim is None:
             with torch.no_grad():
-                dummy_text = ["test"]
-                dummy_tokens = self.tokenizer(dummy_text, context_length=self.max_length)
-                dummy_embedding = self.model.encode_text(dummy_tokens)
-                embedding_dim = dummy_embedding.shape[-1]
-        
+                dummy = self.tokenizer(["test"], context_length=self.max_length)
+                _, emb = self.model.encode_text(dummy)
+                embedding_dim = emb.shape[-1]
+
         self.embedding_dim = embedding_dim
         
         # Convert embedding dims to what diffusion is needed.
         self.use_projection = use_projection
         if use_projection:
-            self.diffusion_dim = 512
             self.projection = nn.Sequential(
                 nn.Linear(embedding_dim, self.diffusion_dim),
                 nn.SiLU(),
+                nn.LayerNorm(self.diffusion_dim),
                 nn.Linear(self.diffusion_dim, self.diffusion_dim)
             )
 
@@ -53,24 +54,15 @@ class CLIPEncoder(nn.Module):
         if isinstance(text, str):
             text = [text]
         
-        tokenized = self.tokenizer(
-            text,
-            context_length=self.max_length
-        )
+        text_tokens = self.tokenizer(text, context_length=self.max_length)
+        text_tokens = text_tokens.to(self.device)
 
-        if isinstance(tokenized, torch.Tensor):
-            tokenized = tokenized.to(self.device)
-
-        with torch.no_grad():
-            raw_embeddings = self.model.encode_text(tokenized)
-            raw_embeddings = raw_embeddings.unsqueeze(1)  
-        
-        if hasattr(self.model, 'logit_scale'):
-            raw_embeddings = raw_embeddings / raw_embeddings.norm(dim=-1, keepdim=True)
+        _, raw_embeddings  = self.model.encode_text(text_tokens)
         
         if self.use_projection:
-            projected_embeddings = self.projection(raw_embeddings)
-            return raw_embeddings, projected_embeddings
+            B, L, D = raw_embeddings.shape
+            projected = self.projection(raw_embeddings.view(B * L, D)).view(B, L, self.diffusion_dim)
+            return raw_embeddings, projected
         else:
             return raw_embeddings, raw_embeddings
         
@@ -88,4 +80,4 @@ class CLIPEncoder(nn.Module):
     def device(self):
         """Get the model's device."""
         return next(self.model.parameters()).device
-    
+  
