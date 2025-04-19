@@ -37,8 +37,8 @@
     ```
     data/
       /IU-XRay
-        /NLMCXR_png      # Contains all PNG format chest X-ray images
-        /Reports         # Contains corresponding medical reports
+        /NLMCXR_png
+        /ecgen-radiology    
     ```
 
 ## 3. Training
