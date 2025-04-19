@@ -4,13 +4,16 @@
 
 1. Create a virtual environment
 
-    ```conda create -n <env_name> python==3.12```
+    ```
+    conda create -n <env_name> python==3.12
+    conda activate <env_name>
+   ```
 
-2. Install dependencies
+3. Install dependencies
 
     ```pip install -r requirements.txt```
 
-3. For this project, you need to setup the `open_clip` dependency based on following guideline:
+4. For this project, you need to setup the `open_clip` dependency based on following guideline:
   * Go to the github page of [open_clip](https://github.com/mlfoundations/open_clip).
   * Clone the repository and put it in the root path of the project directory
   * In `/open_clip/src/open_clip/model.py`, change the `output_tokens` attribute of class `CLIPTextCfg` to `True`. This way, the text encoder will return embeddings of tokens rather than a globally-pooled embedding.
