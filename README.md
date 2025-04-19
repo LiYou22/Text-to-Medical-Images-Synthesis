@@ -44,7 +44,8 @@
 ## 3. Training
 
 1. Navigate to the `train.py` and modify the hyperparameters in the `Config` class based on your settings.
-2. Start the training process with the following command  
+2. Start the training process with the following command
+   
    ```python3 train.py```
 
 ## 4. Inference with Pre-trained Models
