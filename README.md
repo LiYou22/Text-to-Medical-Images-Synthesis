@@ -54,4 +54,6 @@
 2. Save the checkpoint file under `/results` directory.
 3. Generate medical images from text descriptions using the following command:  
    
-   ```python inference.py --checkpoint </path/to/your/checkpoint.pt> --caption <caption> --output <img.png> --n_steps <n_steps> --seed <seed>```
+   ```
+   python inference.py --checkpoint </path/to/your/checkpoint.pt> --caption <caption> --output <img.png> --n_steps <n_steps> --seed <seed> ----batch_size <batch_size>
+   ```
