@@ -257,18 +257,21 @@ class CrossAttention(nn.Module):
         
         self.norm = nn.LayerNorm(query_dim)
 
-    def forward(self, x, context):
+    def forward(self, x, context, context_mask=None):
         b, c, h, w = x.shape
         x_flat = x.reshape(b, c, -1).transpose(1, 2)
         x_norm = self.norm(x_flat)
         heads = self.heads
-        
+
         q = self.to_q(x_norm)
         k = self.to_k(context)
         v = self.to_v(context)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=heads), (q, k, v))
-        
+
         sim = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+        if context_mask is not None:
+            # Exclude padding tokens from the attention targets
+            sim = sim.masked_fill(~context_mask[:, None, None, :].bool(), -torch.finfo(sim.dtype).max)
         attn = sim.softmax(dim=-1)
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
 
@@ -300,19 +303,22 @@ class LinearCrossAttention(nn.Module):
         
         self.norm = nn.LayerNorm(query_dim)
 
-    def forward(self, x, context):
+    def forward(self, x, context, context_mask=None):
         b, c, h, w = x.shape
         x_flat = x.reshape(b, c, -1).transpose(1, 2)
         x_norm = self.norm(x_flat)
         heads = self.heads
-        
+
         q = self.to_q(x_norm)
         k = self.to_k(context)
         v = self.to_v(context)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=heads), (q, k, v))
-        
+
         q = q * self.scale
         q = q.softmax(dim=-1)
+        if context_mask is not None:
+            # Padding tokens get zero weight after the softmax over tokens
+            k = k.masked_fill(~context_mask[:, None, :, None].bool(), -torch.finfo(k.dtype).max)
         k = k.softmax(dim=-2)
         
         context_matrix = einsum('b h j d, b h j e -> b h d e', k, v)
@@ -444,7 +450,7 @@ class Unet(nn.Module):
         self.final_res_block = block_klass(dim * 2, dim, time_emb_dim=time_dim)
         self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
 
-    def forward(self, x, time, context=None, x_self_cond=None):
+    def forward(self, x, time, context=None, x_self_cond=None, context_mask=None):
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim=1)
@@ -464,7 +470,7 @@ class Unet(nn.Module):
             x = attn(x)
             # If context provided, apply cross attention
             if self.use_cross_attention and (context is not None):
-                x = cross_attn(x, context)
+                x = cross_attn(x, context, context_mask)
             h.append(x)
             
             x = downsample(x)
@@ -473,7 +479,7 @@ class Unet(nn.Module):
         x = self.mid_block1(x, t)
         x = self.mid_attn(x)
         if self.use_cross_attention and (context is not None):
-            x = self.mid_cross_attn(x, context)
+            x = self.mid_cross_attn(x, context, context_mask)
         x = self.mid_block2(x, t)
         
         # Upsampling
@@ -484,9 +490,11 @@ class Unet(nn.Module):
             x = torch.cat((x, h.pop()), dim=1)
             x = block2(x, t)
             x = attn(x)
-            if context is not None:
-                x = cross_attn(x, context)
-                
+            # Same guard as the down path: cross_attn is nn.Identity when
+            # cross attention is disabled and must not receive context
+            if self.use_cross_attention and (context is not None):
+                x = cross_attn(x, context, context_mask)
+
             x = upsample(x)
         
         x = torch.cat((x, r), dim=1)

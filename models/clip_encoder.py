@@ -26,6 +26,14 @@ class CLIPEncoder(nn.Module):
         self.max_length = max_length
         self.diffusion_dim = diffusion_dim
 
+        # Token-level text outputs: the text tower checks this flag at forward
+        # time, so no open_clip source modification is needed
+        self.model.text.output_tokens = True
+
+        hf_tokenizer = getattr(self.tokenizer, 'tokenizer', None)
+        pad_id = getattr(hf_tokenizer, 'pad_token_id', None) if hf_tokenizer is not None else None
+        self.pad_token_id = 0 if pad_id is None else pad_id
+
         # Do not fine-tune for now
         for param in self.model.parameters():
             param.requires_grad = False
@@ -49,26 +57,31 @@ class CLIPEncoder(nn.Module):
                 nn.Linear(self.diffusion_dim, self.diffusion_dim)
             )
 
-    def forward(self, text: Union[str, List[str]]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode text into embeddings."""
+    def forward(self, text: Union[str, List[str]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode text into embeddings. Returns (raw, projected, pad_mask)."""
         if isinstance(text, str):
             text = [text]
-        
+
         text_tokens = self.tokenizer(text, context_length=self.max_length)
         text_tokens = text_tokens.to(self.device)
 
         # CLIP backbone is frozen; only the projection should receive gradients
         with torch.no_grad():
             _, raw_embeddings = self.model.encode_text(text_tokens)
-        
+
+        # Pad mask aligned to the returned tokens: the text tower strips the
+        # leading CLS position, so keep the trailing seq_len positions
+        mask = (text_tokens != self.pad_token_id)
+        mask = mask[:, -raw_embeddings.shape[1]:]
+
         if self.use_projection:
             B, L, D = raw_embeddings.shape
             projected = self.projection(raw_embeddings.view(B * L, D)).view(B, L, self.diffusion_dim)
-            return raw_embeddings, projected
+            return raw_embeddings, projected, mask
         else:
-            return raw_embeddings, raw_embeddings
-        
-    def encode_batch(self, captions: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+            return raw_embeddings, raw_embeddings, mask
+
+    def encode_batch(self, captions: List[str]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.forward(captions)
 
     def to(self, device):

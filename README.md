@@ -21,15 +21,7 @@ Text-conditional DDPM that generates 256x256 chest X-ray images from radiology r
 
     ```pip install -r requirements.txt```
 
-3. For this project, you need to setup the `open_clip` dependency based on following guideline:
-  * Go to the github page of [open_clip](https://github.com/mlfoundations/open_clip).
-  * Clone the repository and put it in the root path of the project directory
-  * In `/open_clip/src/open_clip/model.py`, change the `output_tokens` attribute of class `CLIPTextCfg` to `True`. This way, the text encoder will return embeddings of tokens rather than a globally-pooled embedding.
-  * Then run the command:
-    ```
-    cd open_clip
-    pip install -e .
-    ```
+    `open_clip_torch` is installed from PyPI. The text encoder enables token-level outputs at runtime (`model.text.output_tokens = True`), so no modification of the open_clip source is needed.
 
 ## 2. Dataset Download
   * Access the Indiana University Chest X-ray Collection from [Open-i](https://openi.nlm.nih.gov/faq).

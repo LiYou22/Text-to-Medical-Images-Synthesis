@@ -213,13 +213,14 @@ class DiffusionTrainer:
         return x_noisy, noise
         
     def encode_text(self, captions):
+        """Returns (token_embeddings, pad_mask); (None, None) without a text encoder."""
         if self.text_encoder is None:
-            return None
+            return None, None
 
         # Gradients flow through the trainable projection; the CLIP backbone
         # is frozen inside the encoder itself.
-        _, text_embeddings = self.text_encoder.encode_batch(captions)
-        return text_embeddings.to(self.device)
+        _, text_embeddings, mask = self.text_encoder.encode_batch(captions)
+        return text_embeddings.to(self.device), mask.to(self.device)
 
     @torch.no_grad()
     def _update_ema(self):
@@ -228,7 +229,7 @@ class DiffusionTrainer:
         for ema_b, b in zip(self.ema_model.buffers(), self.model.buffers()):
             ema_b.copy_(b)
     
-    def p_losses(self, x_start, t, noise=None, context=None):
+    def p_losses(self, x_start, t, noise=None, context=None, context_mask=None):
         """Define loss function"""
         if noise is None:
             noise = torch.randn_like(x_start, device=self.device)
@@ -238,17 +239,18 @@ class DiffusionTrainer:
 
         # Predict noise
         if getattr(self.model, 'self_condition', False) is True:
-            with torch.no_grad(): 
+            with torch.no_grad():
                 if getattr(self.model, 'use_cross_attention', False) and (context is not None):
-                    predicted_noise_1 = self.model(x_noisy, t, context=context)
+                    predicted_noise_1 = self.model(x_noisy, t, context=context, context_mask=context_mask)
                 else:
                     predicted_noise_1 = self.model(x_noisy, t)
-            
+
             if getattr(self.model, 'use_cross_attention', False) and (context is not None):
                 predicted_noise = self.model(
                     x_noisy,
                     t,
                     context=context,
+                    context_mask=context_mask,
                     x_self_cond=predicted_noise_1
                 )
             else:
@@ -256,7 +258,7 @@ class DiffusionTrainer:
 
         else:
             if getattr(self.model, 'use_cross_attention', False) and (context is not None):
-                predicted_noise = self.model(x_noisy, t, context=context)
+                predicted_noise = self.model(x_noisy, t, context=context, context_mask=context_mask)
             else:
                 predicted_noise = self.model(x_noisy, t)
 
@@ -272,22 +274,22 @@ class DiffusionTrainer:
             
         return loss
     
-    def forward(self, x_start, t=None, captions=None, context=None):
+    def forward(self, x_start, t=None, captions=None, context=None, context_mask=None):
         """Forward pass for evaluation"""
         batch_size = x_start.shape[0]
         if t is None:
             t = torch.ones(batch_size, device=self.device, dtype=torch.long) * (self.timesteps // 2)
-        
+
         if captions is not None and context is None and self.text_encoder is not None:
-            context = self.encode_text(captions)
+            context, context_mask = self.encode_text(captions)
 
         # Add noise
         x_noisy, noise = self.q_sample(x_start, t)
-        
+
         # Predict noise
         with torch.no_grad():
             if hasattr(self.model, 'use_cross_attention') and self.model.use_cross_attention and context is not None:
-                predicted_noise = self.model(x_noisy, t, context=context)
+                predicted_noise = self.model(x_noisy, t, context=context, context_mask=context_mask)
             else:
                 predicted_noise = self.model(x_noisy, t)
         
@@ -302,25 +304,28 @@ class DiffusionTrainer:
         return x_noisy, predicted_noise, noise, loss.item()
 
     @torch.no_grad()
-    def _predict_eps(self, x, t, context=None, model=None, guidance_scale=1.0, null_context=None):
+    def _predict_eps(self, x, t, context=None, context_mask=None, model=None,
+                     guidance_scale=1.0, null_context=None, null_mask=None):
         model = self.model if model is None else model
         if getattr(model, "use_cross_attention", False) and context is not None:
             if guidance_scale != 1.0 and null_context is not None:
                 # Classifier-free guidance
-                eps_cond = model(x, t, context=context)
-                eps_uncond = model(x, t, context=null_context)
+                eps_cond = model(x, t, context=context, context_mask=context_mask)
+                eps_uncond = model(x, t, context=null_context, context_mask=null_mask)
                 return eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-            return model(x, t, context=context)
+            return model(x, t, context=context, context_mask=context_mask)
         return model(x, t)
 
     @torch.no_grad()
-    def p_sample(self, x, t, t_index, context=None, model=None, guidance_scale=1.0, null_context=None):
+    def p_sample(self, x, t, t_index, context=None, context_mask=None, model=None,
+                 guidance_scale=1.0, null_context=None, null_mask=None):
         """Single step of DDPM sampling"""
         betas_t = extract(self.betas, t, x.shape)
         sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
         sqrt_recip_alphas_t = extract(self.sqrt_recip_alphas, t, x.shape)
 
-        eps = self._predict_eps(x, t, context, model=model, guidance_scale=guidance_scale, null_context=null_context)
+        eps = self._predict_eps(x, t, context, context_mask=context_mask, model=model,
+                                guidance_scale=guidance_scale, null_context=null_context, null_mask=null_mask)
         model_mean = sqrt_recip_alphas_t * (x - betas_t * eps / sqrt_one_minus_alphas_cumprod_t)
 
         if t_index == 0:
@@ -331,7 +336,8 @@ class DiffusionTrainer:
         return model_mean + torch.sqrt(variance) * noise
 
     @torch.no_grad()
-    def p_sample_loop(self, shape, context=None, model=None, guidance_scale=1.0, null_context=None, show_progress=True):
+    def p_sample_loop(self, shape, context=None, context_mask=None, model=None,
+                      guidance_scale=1.0, null_context=None, null_mask=None, show_progress=True):
         """Full DDPM sampling loop over all timesteps. Returns all images."""
         device = self.device
         b = shape[0]
@@ -346,15 +352,15 @@ class DiffusionTrainer:
 
         for t_index in iterator:
             t = torch.full((b,), t_index, device=device, dtype=torch.long)
-            img = self.p_sample(img, t, t_index, context, model=model,
-                                guidance_scale=guidance_scale, null_context=null_context)
+            img = self.p_sample(img, t, t_index, context, context_mask=context_mask, model=model,
+                                guidance_scale=guidance_scale, null_context=null_context, null_mask=null_mask)
             imgs.append(img.cpu().detach())
 
         return imgs
 
     @torch.no_grad()
-    def ddim_sample_loop(self, shape, context=None, n_steps=50, eta=0.0, model=None,
-                         guidance_scale=1.0, null_context=None, show_progress=True):
+    def ddim_sample_loop(self, shape, context=None, context_mask=None, n_steps=50, eta=0.0, model=None,
+                         guidance_scale=1.0, null_context=None, null_mask=None, show_progress=True):
         """DDIM sampling over a strided subset of timesteps. Returns all images."""
         device = self.device
         b = shape[0]
@@ -370,8 +376,8 @@ class DiffusionTrainer:
 
         for time, time_next in iterator:
             t = torch.full((b,), time, device=device, dtype=torch.long)
-            eps = self._predict_eps(img, t, context, model=model,
-                                    guidance_scale=guidance_scale, null_context=null_context)
+            eps = self._predict_eps(img, t, context, context_mask=context_mask, model=model,
+                                    guidance_scale=guidance_scale, null_context=null_context, null_mask=null_mask)
 
             alpha = self.alphas_cumprod[time]
             x0 = (img - (1 - alpha).sqrt() * eps) / alpha.sqrt()
@@ -391,38 +397,42 @@ class DiffusionTrainer:
         return imgs
 
     @torch.no_grad()
-    def sample(self, batch_size=32, captions=None, context=None, n_steps=None,
+    def sample(self, batch_size=32, captions=None, context=None, context_mask=None, n_steps=None,
                guidance_scale=1.0, use_ema=True, show_progress=True):
         """Method for generating samples"""
         image_shape = (batch_size, self.channels, self.image_size, self.image_size)
 
         if captions is not None and context is None and self.text_encoder is not None:
-            context = self.encode_text(captions)
+            context, context_mask = self.encode_text(captions)
 
         model = self.ema_model if use_ema else self.model
         model.eval()
 
-        null_context = None
+        null_context, null_mask = None, None
         if guidance_scale != 1.0 and context is not None and self.text_encoder is not None:
-            null_context = self.encode_text([""] * batch_size)
+            null_context, null_mask = self.encode_text([""] * batch_size)
 
         if n_steps is not None and n_steps < self.timesteps:
             samples = self.ddim_sample_loop(
                 shape=image_shape,
                 context=context,
+                context_mask=context_mask,
                 n_steps=n_steps,
                 model=model,
                 guidance_scale=guidance_scale,
                 null_context=null_context,
+                null_mask=null_mask,
                 show_progress=show_progress
             )
         else:
             samples = self.p_sample_loop(
                 shape=image_shape,
                 context=context,
+                context_mask=context_mask,
                 model=model,
                 guidance_scale=guidance_scale,
                 null_context=null_context,
+                null_mask=null_mask,
                 show_progress=show_progress
             )
 
@@ -439,11 +449,12 @@ class DiffusionTrainer:
         if len(text) != batch_size:
             raise ValueError(f"Number of captions ({len(text)}) must match batch_size ({batch_size})")
 
-        context = self.encode_text(text)
+        context, context_mask = self.encode_text(text)
 
         return self.sample(
             batch_size=batch_size,
             context=context,
+            context_mask=context_mask,
             n_steps=n_steps,
             guidance_scale=guidance_scale,
             use_ema=use_ema,
@@ -482,11 +493,11 @@ class DiffusionTrainer:
             for batch in tqdm(val_loader, desc="Validation"):
                 x = batch["pixel_values"].to(self.device)
                 captions = batch["caption"]
-                batch_context = self.encode_text(captions)
+                batch_context, batch_mask = self.encode_text(captions)
 
                 batch_size = x.shape[0]
                 t = torch.randint(0, self.timesteps, (batch_size,), device=self.device).long()
-                loss = self.p_losses(x, t, context=batch_context)
+                loss = self.p_losses(x, t, context=batch_context, context_mask=batch_mask)
 
                 total_loss += loss.item()
                 batch_count += 1
@@ -499,10 +510,11 @@ class DiffusionTrainer:
         real = gen_batch["pixel_values"].to(self.device)
         captions = gen_batch["caption"]
         with torch.no_grad():
-            gen_context = self.encode_text(captions)
+            gen_context, gen_mask = self.encode_text(captions)
             generated = self.sample(
                 batch_size=real.shape[0],
                 context=gen_context,
+                context_mask=gen_mask,
                 n_steps=n_steps,
                 show_progress=False
             )
@@ -544,10 +556,13 @@ class DiffusionTrainer:
 
                     # Get caption
                     captions = batch.get("caption", None)
-                    context = self.encode_text(captions) if captions is not None and self.text_encoder is not None else None
+                    if captions is not None and self.text_encoder is not None:
+                        context, context_mask = self.encode_text(captions)
+                    else:
+                        context, context_mask = None, None
                 else:
                     x = batch.to(self.device)
-                    context = None
+                    context, context_mask = None, None
 
                 batch_size = x.shape[0]
 
@@ -555,8 +570,9 @@ class DiffusionTrainer:
                 if context is not None and self.cond_drop_prob > 0:
                     drop_mask = torch.rand(batch_size, device=self.device) < self.cond_drop_prob
                     if drop_mask.any():
-                        null_context = self.encode_text([""] * batch_size)
+                        null_context, null_mask = self.encode_text([""] * batch_size)
                         context = torch.where(drop_mask[:, None, None], null_context, context)
+                        context_mask = torch.where(drop_mask[:, None], null_mask, context_mask)
 
                 # Sample random timesteps
                 t = torch.randint(0, self.timesteps, (batch_size,), device=self.device).long()
@@ -564,7 +580,7 @@ class DiffusionTrainer:
                 # Compute loss (mixed precision when enabled)
                 self.optimizer.zero_grad()
                 with torch.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-                    loss = self.p_losses(x, t, context=context)
+                    loss = self.p_losses(x, t, context=context, context_mask=context_mask)
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.trainable_params, 0.5)
@@ -647,8 +663,8 @@ class DiffusionTrainer:
             gen = generated[:sample_size]
         else:
             with torch.no_grad():
-                ctx = self.encode_text(caps)
-            gen = self.sample(batch_size=sample_size, context=ctx, n_steps=n_steps)
+                ctx, ctx_mask = self.encode_text(caps)
+            gen = self.sample(batch_size=sample_size, context=ctx, context_mask=ctx_mask, n_steps=n_steps)
 
         print(f"Real: min={real.min().item():.4f}, max={real.max().item():.4f}, mean={real.mean().item():.4f}")
         print(f"Generated: min={gen.min().item():.4f}, max={gen.max().item():.4f}, mean={gen.mean().item():.4f}")
