@@ -457,48 +457,54 @@ class DiffusionTrainer:
 
     def validate(self, val_loader, n_steps=200):
         self.model.eval()
-        total_loss = 0
-        total_psnr = 0
-        total_ssim = 0
+        total_loss = 0.0
         batch_count = 0
 
-        for batch in tqdm(val_loader, desc="Validation"):
-            x = batch["pixel_values"].to(self.device)
-            captions = batch["caption"]
-            with torch.no_grad():
+        # Denoising loss over the full val set with random t, same as training,
+        # so train/val loss curves are directly comparable
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Validation"):
+                x = batch["pixel_values"].to(self.device)
+                captions = batch["caption"]
                 batch_context = self.encode_text(captions)
-        
-            batch_size = x.shape[0]
 
-            # Evaluate with forward method
-            _, _, _, loss = self.forward(x, context=batch_context)
-                
-            # Generate samples and compute metrics
-            with torch.no_grad():
-                generated = self.sample(
-                    batch_size=batch_size, 
-                    context=batch_context, 
-                    n_steps=n_steps, 
-                    show_progress=False
-                )
-                metrics = self.compute_metrics(x, generated)
+                batch_size = x.shape[0]
+                t = torch.randint(0, self.timesteps, (batch_size,), device=self.device).long()
+                loss = self.p_losses(x, t, context=batch_context)
 
-            total_loss += loss
-            total_psnr += metrics["psnr"]
-            total_ssim += metrics["ssim"]
-            batch_count += 1
+                total_loss += loss.item()
+                batch_count += 1
 
-        # Calculate average metrics
         avg_loss = total_loss / batch_count
-        avg_psnr = total_psnr / batch_count
-        avg_ssim = total_ssim / batch_count
-        
+
+        # Generative metrics only on the first val batch (fixed since
+        # the loader does not shuffle); sampling the whole set is too slow
+        gen_batch = next(iter(val_loader))
+        real = gen_batch["pixel_values"].to(self.device)
+        captions = gen_batch["caption"]
+        with torch.no_grad():
+            gen_context = self.encode_text(captions)
+            generated = self.sample(
+                batch_size=real.shape[0],
+                context=gen_context,
+                n_steps=n_steps,
+                show_progress=False
+            )
+            metrics = self.compute_metrics(real, generated)
+
         # Update history
         self.history["val_losses"].append(avg_loss)
-        self.history["val_psnr"].append(avg_psnr)
-        self.history["val_ssim"].append(avg_ssim)
-        
-        return {"loss": avg_loss, "psnr": avg_psnr, "ssim": avg_ssim}
+        self.history["val_psnr"].append(metrics["psnr"])
+        self.history["val_ssim"].append(metrics["ssim"])
+
+        return {
+            "loss": avg_loss,
+            "psnr": metrics["psnr"],
+            "ssim": metrics["ssim"],
+            "real": real,
+            "captions": captions,
+            "generated": generated
+        }
     
     def train(self, epochs, start_epoch=0, val_loader=None, n_steps=200, save_model_every_epoch=True):
         for epoch in range(start_epoch, epochs):
@@ -550,18 +556,16 @@ class DiffusionTrainer:
             # Update training history
             self.history["train_losses"].append(avg_loss)
             
-            # Validation
+            # Validation + visualization (reuse the samples generated during validation)
             if val_loader is not None:
                 val_metrics = self.validate(val_loader, n_steps)
                 print(f"Validation - Loss: {val_metrics['loss']:.6f}, PSNR: {val_metrics['psnr']:.2f}, SSIM: {val_metrics['ssim']:.4f}")
-            
-            # Visualization
-            if val_loader is not None:
-                val_batch = next(iter(val_loader))
+
                 sample_paths = self.visualize_samples(
                     epoch=epoch+1,
-                    real_images=val_batch["pixel_values"],
-                    captions=val_batch["caption"],
+                    real_images=val_metrics["real"],
+                    captions=val_metrics["captions"],
+                    generated=val_metrics["generated"],
                     batch_size=8,
                     n_steps=n_steps
                 )
@@ -571,17 +575,20 @@ class DiffusionTrainer:
             if save_model_every_epoch:
                 self.save_model(f"model-epoch-{epoch+1}.pt")
 
-    def visualize_samples(self, epoch, real_images, captions, batch_size=8, n_steps=1000):
+    def visualize_samples(self, epoch, real_images, captions, generated=None, batch_size=8, n_steps=1000):
         vis_dir = self.results_folder / 'visualization' / f'epoch-{epoch}'
         vis_dir.mkdir(exist_ok=True, parents=True)
-        
+
         sample_size = min(batch_size, len(real_images))
         real = real_images[:sample_size].to(self.device)
         caps = captions[:sample_size]
-        
-        with torch.no_grad():
-            ctx = self.encode_text(caps)
-        gen = self.sample(batch_size=sample_size, context=ctx, n_steps=n_steps)
+
+        if generated is not None:
+            gen = generated[:sample_size]
+        else:
+            with torch.no_grad():
+                ctx = self.encode_text(caps)
+            gen = self.sample(batch_size=sample_size, context=ctx, n_steps=n_steps)
 
         print(f"Real: min={real.min().item():.4f}, max={real.max().item():.4f}, mean={real.mean().item():.4f}")
         print(f"Generated: min={gen.min().item():.4f}, max={gen.max().item():.4f}, mean={gen.mean().item():.4f}")

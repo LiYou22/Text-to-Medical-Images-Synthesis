@@ -29,9 +29,11 @@ class IUXrayDataset(Dataset):
         self.image_dir = os.path.join(data_dir, 'NLMCXR_png')
         self.report_dir = os.path.join(data_dir, 'ecgen-radiology')
         
-        xml_files = glob.glob(os.path.join(self.report_dir, '*.xml'))
-        
-        self.samples = []
+        xml_files = sorted(glob.glob(os.path.join(self.report_dir, '*.xml')))
+
+        # Group samples by report so the train/val split never puts images
+        # from the same report (same patient/caption) on both sides
+        report_groups = []
         for xml_file in xml_files:
             try:
                 tree = ET.parse(xml_file)
@@ -62,39 +64,45 @@ class IUXrayDataset(Dataset):
                 if len(caption) > 512:
                     caption = caption[:512] + "..."
                 
+                report_samples = []
                 for image in root.findall('.//parentImage'):
                     image_id = image.get('id')
                     if image_id:
                         image_path = os.path.join(self.image_dir, f"{image_id}.png")
                         if os.path.exists(image_path):
-                            self.samples.append({
+                            report_samples.append({
                                 'image_path': image_path,
                                 'caption': caption,
                                 'report': report_text,
                                 'mesh_terms': mesh_terms
                             })
+                if report_samples:
+                    report_groups.append(report_samples)
             except Exception as e:
                 logger.error(f"Error processing {xml_file}: {e}")
-        
-        logger.info(f"Loaded {len(self.samples)} samples")
-        
-        random.seed(42)
-        random.shuffle(self.samples)
-        
-        split_idx = int(len(self.samples) * split_ratio)
+
+        # Local RNG so we don't pollute the global random state
+        rng = random.Random(42)
+        rng.shuffle(report_groups)
+
+        split_idx = int(len(report_groups) * split_ratio)
         if is_train:
-            self.samples = self.samples[:split_idx]
+            report_groups = report_groups[:split_idx]
         else:
-            self.samples = self.samples[split_idx:]
+            report_groups = report_groups[split_idx:]
+
+        self.samples = [s for group in report_groups for s in group]
+        logger.info(f"Loaded {len(self.samples)} samples from {len(report_groups)} reports ({'train' if is_train else 'val'})")
 
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
         
         if is_train:
+            # No horizontal flip: it mirrors anatomy (heart laterality) and
+            # contradicts left/right mentions in the captions
             self.transform = transforms.Compose([
                 transforms.Resize((image_size, image_size)),
-                transforms.RandomHorizontalFlip(p=0.3), 
-                transforms.RandomAffine(0, translate=(0.02, 0.02), scale=(0.98, 1.02)), 
+                transforms.RandomAffine(0, translate=(0.02, 0.02), scale=(0.98, 1.02)),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5])
             ])
