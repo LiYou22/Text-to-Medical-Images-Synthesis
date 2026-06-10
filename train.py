@@ -39,6 +39,8 @@ class Config:
     scheduler_type = "cosine"
     scheduler_params = {"T_max": 30, "eta_min": 2e-6}
     n_steps = 1000
+    cond_drop_prob = 0.1
+    ema_decay = 0.9995
     
     split_ratio = 0.99
     max_samples = None
@@ -152,7 +154,9 @@ def main():
         results_folder=Config.results_folder,
         loss_type=Config.loss_type,
         scheduler_type=Config.scheduler_type,
-        scheduler_params=Config.scheduler_params
+        scheduler_params=Config.scheduler_params,
+        cond_drop_prob=Config.cond_drop_prob,
+        ema_decay=Config.ema_decay
     )
 
     start_epoch = 0

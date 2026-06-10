@@ -33,8 +33,9 @@ class Config:
     beta_schedule = "cosine"
     image_size = 256
     n_steps = 1000
+    guidance_scale = 3.0
     scheduler_type = "cosine"
-    scheduler_params = {"T_max": 50, "eta_min": 5e-6} 
+    scheduler_params = {"T_max": 50, "eta_min": 5e-6}
 
 
 def set_seed(seed):
@@ -80,10 +81,11 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint.")
     parser.add_argument("--caption", type=str, required=True, help="Medical description for generating the image.")
     parser.add_argument("--output", type=str, default="generated_image.png", help="Path to save the output image.")
-    parser.add_argument("--n_steps", type=int, default=Config.n_steps, help="Number of sampling steps.")
+    parser.add_argument("--n_steps", type=int, default=Config.n_steps, help="Number of sampling steps (DDIM is used when fewer than the training timesteps).")
     parser.add_argument("--seed", type=int, default=Config.seed, help="Random seed for reproducibility.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for generating multiple images from same prompt.")
-    
+    parser.add_argument("--guidance_scale", type=float, default=Config.guidance_scale, help="Classifier-free guidance scale (1.0 disables guidance).")
+
     args = parser.parse_args()
     
     Config.seed = args.seed
@@ -141,21 +143,28 @@ def main():
     try:
         checkpoint = torch.load(args.checkpoint, map_location=Config.device)
         trainer.model.load_state_dict(checkpoint['model_state_dict'])
+        # Sample with EMA weights when available; fall back to the raw model
+        trainer.ema_model.load_state_dict(checkpoint.get('ema_state_dict', checkpoint['model_state_dict']))
+        if 'text_projection_state_dict' in checkpoint and Config.use_projection:
+            text_encoder.projection.load_state_dict(checkpoint['text_projection_state_dict'])
+        else:
+            print("Warning: checkpoint has no text projection weights; using randomly initialized projection.")
         print("Model loaded successfully!")
     except Exception as e:
         print(f"Error loading model: {e}")
         return
-    
+
     trainer.model.eval()
-    
+
     print(f"Generating image(s) with caption: \"{args.caption}\"")
-    print(f"Using {args.n_steps} sampling steps")
-    
+    print(f"Using {args.n_steps} sampling steps, guidance scale {args.guidance_scale}")
+
     with torch.no_grad():
         generated_images = trainer.sample_from_text(
             text=args.caption,
             batch_size=Config.batch_size,
-            n_steps=args.n_steps
+            n_steps=args.n_steps,
+            guidance_scale=args.guidance_scale
         )
     
     if Config.batch_size == 1:

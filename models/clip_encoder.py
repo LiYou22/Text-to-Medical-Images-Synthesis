@@ -57,7 +57,9 @@ class CLIPEncoder(nn.Module):
         text_tokens = self.tokenizer(text, context_length=self.max_length)
         text_tokens = text_tokens.to(self.device)
 
-        _, raw_embeddings  = self.model.encode_text(text_tokens)
+        # CLIP backbone is frozen; only the projection should receive gradients
+        with torch.no_grad():
+            _, raw_embeddings = self.model.encode_text(text_tokens)
         
         if self.use_projection:
             B, L, D = raw_embeddings.shape

@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR
+from copy import deepcopy
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
@@ -86,16 +87,20 @@ class DiffusionTrainer:
         results_folder="./results",
         loss_type="huber",
         scheduler_type="step",
-        scheduler_params = None
+        scheduler_params = None,
+        cond_drop_prob=0.1,
+        ema_decay=0.9995
     ):
         self.model = model
         self.dataloader = dataloader
-        self.text_encoder = text_encoder 
+        self.text_encoder = text_encoder
         self.timesteps = timesteps
         self.image_size = image_size
         self.channels = channels
         self.batch_size = batch_size
         self.loss_type = loss_type
+        self.cond_drop_prob = cond_drop_prob
+        self.ema_decay = ema_decay
 
         # Setup device
         self.device = device if device is not None else "cuda" if torch.cuda.is_available() else "cpu"
@@ -104,6 +109,11 @@ class DiffusionTrainer:
         if self.text_encoder is not None:
             self.text_encoder.to(self.device)
 
+        # EMA copy of the UNet, used for sampling
+        self.ema_model = deepcopy(self.model).eval()
+        for p in self.ema_model.parameters():
+            p.requires_grad_(False)
+
         # Create folder to save the results
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok=True)
@@ -111,8 +121,11 @@ class DiffusionTrainer:
         (self.results_folder / 'plots').mkdir(exist_ok=True)
         (self.results_folder / 'checkpoints').mkdir(exist_ok=True)
 
-        # Set up optimizer
-        self.optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+        # Set up optimizer (include the text projection so it actually gets trained)
+        params = list(model.parameters())
+        if self.text_encoder is not None and getattr(self.text_encoder, "use_projection", False):
+            params += list(self.text_encoder.projection.parameters())
+        self.optimizer = AdamW(params, lr=lr, weight_decay=0.01)
 
         # Set up learning rate scheduler
         if scheduler_type == "step" and scheduler_params != None:
@@ -186,12 +199,18 @@ class DiffusionTrainer:
     def encode_text(self, captions):
         if self.text_encoder is None:
             return None
-        
-        with torch.no_grad():
-            _, text_embeddings = self.text_encoder.encode_batch(captions)
-            text_embeddings = text_embeddings.to(self.device)
-        
-        return text_embeddings
+
+        # Gradients flow through the trainable projection; the CLIP backbone
+        # is frozen inside the encoder itself.
+        _, text_embeddings = self.text_encoder.encode_batch(captions)
+        return text_embeddings.to(self.device)
+
+    @torch.no_grad()
+    def _update_ema(self):
+        for ema_p, p in zip(self.ema_model.parameters(), self.model.parameters()):
+            ema_p.lerp_(p, 1.0 - self.ema_decay)
+        for ema_b, b in zip(self.ema_model.buffers(), self.model.buffers()):
+            ema_b.copy_(b)
     
     def p_losses(self, x_start, t, noise=None, context=None):
         """Define loss function"""
@@ -267,19 +286,25 @@ class DiffusionTrainer:
         return x_noisy, predicted_noise, noise, loss.item()
 
     @torch.no_grad()
-    def _predict_eps(self, x, t, context=None):
-        if getattr(self.model, "use_cross_attention", False) and context is not None:
-            return self.model(x, t, context=context)
-        return self.model(x, t)
-        
+    def _predict_eps(self, x, t, context=None, model=None, guidance_scale=1.0, null_context=None):
+        model = self.model if model is None else model
+        if getattr(model, "use_cross_attention", False) and context is not None:
+            if guidance_scale != 1.0 and null_context is not None:
+                # Classifier-free guidance
+                eps_cond = model(x, t, context=context)
+                eps_uncond = model(x, t, context=null_context)
+                return eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+            return model(x, t, context=context)
+        return model(x, t)
+
     @torch.no_grad()
-    def p_sample(self, x, t, t_index, context=None):
+    def p_sample(self, x, t, t_index, context=None, model=None, guidance_scale=1.0, null_context=None):
         """Single step of DDPM sampling"""
         betas_t = extract(self.betas, t, x.shape)
         sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
         sqrt_recip_alphas_t = extract(self.sqrt_recip_alphas, t, x.shape)
 
-        eps = self._predict_eps(x, t, context)
+        eps = self._predict_eps(x, t, context, model=model, guidance_scale=guidance_scale, null_context=null_context)
         model_mean = sqrt_recip_alphas_t * (x - betas_t * eps / sqrt_one_minus_alphas_cumprod_t)
 
         if t_index == 0:
@@ -287,72 +312,125 @@ class DiffusionTrainer:
         noise = torch.randn_like(x)
         variance = extract(self.posterior_variance, t, x.shape)
 
-        #return model_mean + torch.sqrt(variance) * noise
-        result = model_mean + torch.sqrt(variance) * noise
-        return torch.clamp(result, min=-1.0, max=1.0)    # -> [-1, 1] 
+        return model_mean + torch.sqrt(variance) * noise
 
     @torch.no_grad()
-    def p_sample_loop(self, shape, context=None, n_steps=None, show_progress=True):
-        """Complete DDPM sampling loop. Returns all images."""
+    def p_sample_loop(self, shape, context=None, model=None, guidance_scale=1.0, null_context=None, show_progress=True):
+        """Full DDPM sampling loop over all timesteps. Returns all images."""
         device = self.device
         b = shape[0]
 
-        if n_steps is not None and n_steps < self.timesteps:
-            step_size = self.timesteps // n_steps
-            timesteps = torch.arange(0, self.timesteps, step_size, device=device)[:n_steps]
-        else:
-            timesteps = torch.arange(0, self.timesteps, 1, device=device)
-            
         # Start from pure noise
         img = torch.randn(shape, device=device)
         imgs = []
 
+        iterator = range(self.timesteps - 1, -1, -1)
         if show_progress:
-            iterator = tqdm(range(len(timesteps)), desc='DDPM sampling', total=len(timesteps))
-        else:
-            iterator = range(len(timesteps))
-    
-        for i in iterator:
-            t_index = len(timesteps) - i - 1
-            t = torch.full((b,), timesteps[t_index], device=device, dtype=torch.long)
-            img = self.p_sample(img, t, t_index, context)
+            iterator = tqdm(iterator, desc='DDPM sampling', total=self.timesteps)
+
+        for t_index in iterator:
+            t = torch.full((b,), t_index, device=device, dtype=torch.long)
+            img = self.p_sample(img, t, t_index, context, model=model,
+                                guidance_scale=guidance_scale, null_context=null_context)
             imgs.append(img.cpu().detach())
 
         return imgs
 
     @torch.no_grad()
-    def sample(self, batch_size=32, captions=None, context=None, n_steps=None, show_progress=True):
+    def ddim_sample_loop(self, shape, context=None, n_steps=50, eta=0.0, model=None,
+                         guidance_scale=1.0, null_context=None, show_progress=True):
+        """DDIM sampling over a strided subset of timesteps. Returns all images."""
+        device = self.device
+        b = shape[0]
+
+        times = torch.linspace(-1, self.timesteps - 1, steps=n_steps + 1)
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:]))
+
+        img = torch.randn(shape, device=device)
+        imgs = []
+
+        iterator = tqdm(time_pairs, desc='DDIM sampling') if show_progress else time_pairs
+
+        for time, time_next in iterator:
+            t = torch.full((b,), time, device=device, dtype=torch.long)
+            eps = self._predict_eps(img, t, context, model=model,
+                                    guidance_scale=guidance_scale, null_context=null_context)
+
+            alpha = self.alphas_cumprod[time]
+            x0 = (img - (1 - alpha).sqrt() * eps) / alpha.sqrt()
+            x0.clamp_(-1.0, 1.0)
+
+            if time_next < 0:
+                img = x0
+            else:
+                alpha_next = self.alphas_cumprod[time_next]
+                sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+                c = (1 - alpha_next - sigma ** 2).sqrt()
+                noise = torch.randn_like(img)
+                img = x0 * alpha_next.sqrt() + c * eps + sigma * noise
+
+            imgs.append(img.cpu().detach())
+
+        return imgs
+
+    @torch.no_grad()
+    def sample(self, batch_size=32, captions=None, context=None, n_steps=None,
+               guidance_scale=1.0, use_ema=True, show_progress=True):
         """Method for generating samples"""
         image_shape = (batch_size, self.channels, self.image_size, self.image_size)
 
         if captions is not None and context is None and self.text_encoder is not None:
             context = self.encode_text(captions)
 
-        samples = self.p_sample_loop(
-            shape=image_shape, 
-            context=context, 
-            n_steps=n_steps,
-            show_progress=show_progress
-        )
+        model = self.ema_model if use_ema else self.model
+        model.eval()
+
+        null_context = None
+        if guidance_scale != 1.0 and context is not None and self.text_encoder is not None:
+            null_context = self.encode_text([""] * batch_size)
+
+        if n_steps is not None and n_steps < self.timesteps:
+            samples = self.ddim_sample_loop(
+                shape=image_shape,
+                context=context,
+                n_steps=n_steps,
+                model=model,
+                guidance_scale=guidance_scale,
+                null_context=null_context,
+                show_progress=show_progress
+            )
+        else:
+            samples = self.p_sample_loop(
+                shape=image_shape,
+                context=context,
+                model=model,
+                guidance_scale=guidance_scale,
+                null_context=null_context,
+                show_progress=show_progress
+            )
 
         return samples[-1]
-    
+
     @torch.no_grad()
-    def sample_from_text(self, text, batch_size=1, n_steps=None, show_progress=True):
+    def sample_from_text(self, text, batch_size=1, n_steps=None, guidance_scale=1.0,
+                         use_ema=True, show_progress=True):
         if isinstance(text, str):
             text = [text] * batch_size
         elif len(text) == 1 and batch_size > 1:
             text = text * batch_size
-        
+
         if len(text) != batch_size:
             raise ValueError(f"Number of captions ({len(text)}) must match batch_size ({batch_size})")
-    
+
         context = self.encode_text(text)
-        
+
         return self.sample(
-            batch_size=batch_size, 
-            context=context, 
+            batch_size=batch_size,
+            context=context,
             n_steps=n_steps,
+            guidance_scale=guidance_scale,
+            use_ema=use_ema,
             show_progress=show_progress
         )
         
@@ -385,9 +463,10 @@ class DiffusionTrainer:
         batch_count = 0
 
         for batch in tqdm(val_loader, desc="Validation"):
-            x = batch["pixel_values"].to(self.device)      
+            x = batch["pixel_values"].to(self.device)
             captions = batch["caption"]
-            batch_context = self.encode_text(captions)
+            with torch.no_grad():
+                batch_context = self.encode_text(captions)
         
             batch_size = x.shape[0]
 
@@ -430,26 +509,34 @@ class DiffusionTrainer:
             for step, batch in enumerate(tqdm(self.dataloader, desc=f"Epoch {epoch+1}/{epochs}")):
                 if isinstance(batch, dict):
                     x = batch["pixel_values"].to(self.device)
-                    
+
                     # Get caption
                     captions = batch.get("caption", None)
                     context = self.encode_text(captions) if captions is not None and self.text_encoder is not None else None
                 else:
                     x = batch.to(self.device)
                     context = None
-                
+
                 batch_size = x.shape[0]
-                
+
+                # Caption dropout for classifier-free guidance
+                if context is not None and self.cond_drop_prob > 0:
+                    drop_mask = torch.rand(batch_size, device=self.device) < self.cond_drop_prob
+                    if drop_mask.any():
+                        null_context = self.encode_text([""] * batch_size)
+                        context = torch.where(drop_mask[:, None, None], null_context, context)
+
                 # Sample random timesteps
                 t = torch.randint(0, self.timesteps, (batch_size,), device=self.device).long()
-                
+
                 # Compute loss
                 self.optimizer.zero_grad()
                 loss = self.p_losses(x, t, context=context)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
                 self.optimizer.step()
-                
+                self._update_ema()
+
                 epoch_loss += loss.item()
                 batch_count += 1
 
@@ -492,7 +579,8 @@ class DiffusionTrainer:
         real = real_images[:sample_size].to(self.device)
         caps = captions[:sample_size]
         
-        ctx = self.encode_text(caps)
+        with torch.no_grad():
+            ctx = self.encode_text(caps)
         gen = self.sample(batch_size=sample_size, context=ctx, n_steps=n_steps)
 
         print(f"Real: min={real.min().item():.4f}, max={real.max().item():.4f}, mean={real.mean().item():.4f}")
@@ -538,11 +626,15 @@ class DiffusionTrainer:
 
         save_dict = {
             'model_state_dict': self.model.state_dict(),
+            'ema_state_dict': self.ema_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'history': self.history
         }
-        
+
+        if self.text_encoder is not None and getattr(self.text_encoder, "use_projection", False):
+            save_dict['text_projection_state_dict'] = self.text_encoder.projection.state_dict()
+
         if epoch is not None:
             save_dict['epoch'] = epoch
 
@@ -551,6 +643,11 @@ class DiffusionTrainer:
     def load_model(self, checkpoint_path):
         checkpoint = torch.load(str(checkpoint_path))
         self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Older checkpoints have no EMA weights; fall back to the raw model
+        self.ema_model.load_state_dict(checkpoint.get('ema_state_dict', checkpoint['model_state_dict']))
+        if ('text_projection_state_dict' in checkpoint and self.text_encoder is not None
+                and getattr(self.text_encoder, "use_projection", False)):
+            self.text_encoder.projection.load_state_dict(checkpoint['text_projection_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
