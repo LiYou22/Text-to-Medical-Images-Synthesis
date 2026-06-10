@@ -180,3 +180,7 @@ results/
 results-1/
 results-2/
 
+# Local docs (not tracked)
+doc/
+logs/
+

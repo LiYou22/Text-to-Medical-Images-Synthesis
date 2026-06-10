@@ -9,6 +9,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from copy import deepcopy
+import time
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
@@ -521,9 +522,16 @@ class DiffusionTrainer:
             "generated": generated
         }
     
-    def train(self, epochs, start_epoch=0, val_loader=None, n_steps=200, save_model_every_epoch=True):
+    def train(self, epochs, start_epoch=0, val_loader=None, n_steps=200, save_model_every_epoch=True,
+              max_train_hours=None, checkpoint_every_min=30, keep_checkpoints=3):
         if self.writer is None:
             self.writer = SummaryWriter(log_dir=str(self.results_folder / 'tensorboard'))
+
+        # Time-limited GPU sessions: stop gracefully before the session is
+        # killed and checkpoint periodically so a hard kill loses <30 min
+        start_time = time.time()
+        deadline = start_time + max_train_hours * 3600 if max_train_hours is not None else None
+        last_periodic_save = start_time
 
         for epoch in range(start_epoch, epochs):
             self.model.train()
@@ -570,6 +578,19 @@ class DiffusionTrainer:
                 if self.writer is not None and self.global_step % 10 == 0:
                     self.writer.add_scalar('train/step_loss', loss.item(), self.global_step)
 
+                now = time.time()
+                if checkpoint_every_min and now - last_periodic_save >= checkpoint_every_min * 60:
+                    self.save_model("model-latest.pt", epoch=epoch, mid_epoch=True)
+                    last_periodic_save = now
+
+                if deadline is not None and now >= deadline:
+                    self.save_model("model-latest.pt", epoch=epoch, mid_epoch=True)
+                    self.writer.flush()
+                    print(f"\nTime budget of {max_train_hours}h reached at epoch {epoch+1}, step {step+1}. "
+                          f"Saved model-latest.pt; rerun train.py in the next session to resume "
+                          f"(epoch {epoch+1} restarts from its beginning).")
+                    return False
+
             # Update learning rate
             self.scheduler.step()
             
@@ -608,9 +629,11 @@ class DiffusionTrainer:
 
             # Save model at the end of each epoch
             if save_model_every_epoch:
-                self.save_model(f"model-epoch-{epoch+1}.pt")
+                self.save_model(f"model-epoch-{epoch+1}.pt", epoch=epoch)
+                self._prune_checkpoints(keep=keep_checkpoints)
 
         self.writer.flush()
+        return True
 
     def visualize_samples(self, epoch, real_images, captions, generated=None, batch_size=8, n_steps=1000):
         vis_dir = self.results_folder / 'visualization' / f'epoch-{epoch}'
@@ -665,7 +688,16 @@ class DiffusionTrainer:
             
         return saved
             
-    def save_model(self, filename, epoch=None):
+    def _prune_checkpoints(self, keep=3):
+        """Keep only the newest per-epoch checkpoints to bound disk usage."""
+        ckpts = sorted(
+            (self.results_folder / 'checkpoints').glob("model-epoch-*.pt"),
+            key=lambda p: p.stat().st_mtime
+        )
+        for p in ckpts[:-keep]:
+            p.unlink()
+
+    def save_model(self, filename, epoch=None, mid_epoch=False):
         save_path = self.results_folder / 'checkpoints'
 
         save_dict = {
@@ -674,7 +706,9 @@ class DiffusionTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
-            'history': self.history
+            'history': self.history,
+            'global_step': self.global_step,
+            'mid_epoch': mid_epoch
         }
 
         if self.model_config is not None:
@@ -686,7 +720,10 @@ class DiffusionTrainer:
         if epoch is not None:
             save_dict['epoch'] = epoch
 
-        torch.save(save_dict, save_path / filename)
+        # Atomic write: a session killed mid-save never corrupts the checkpoint
+        tmp_path = save_path / (filename + ".tmp")
+        torch.save(save_dict, tmp_path)
+        tmp_path.replace(save_path / filename)
 
     def load_model(self, checkpoint_path):
         checkpoint = torch.load(str(checkpoint_path))
@@ -711,13 +748,15 @@ class DiffusionTrainer:
 
         if 'history' in checkpoint:
             self.history = checkpoint['history']
-        
+        self.global_step = checkpoint.get('global_step', 0)
+
         next_epoch = 0
         if 'epoch' in checkpoint:
-            next_epoch = checkpoint['epoch'] + 1
+            # Mid-epoch checkpoints restart their epoch; end-of-epoch ones continue
+            next_epoch = checkpoint['epoch'] if checkpoint.get('mid_epoch', False) else checkpoint['epoch'] + 1
         elif len(self.history['train_losses']) > 0:
             next_epoch = len(self.history['train_losses'])
-        
+
         return next_epoch
 
     def plot_losses(self):

@@ -23,16 +23,17 @@ def find_latest_checkpoint(results_folder):
     results_path = Path(results_folder) / "checkpoints"
     if not results_path.exists():
         return None
-    
-    model_files = []
-    for pattern in ["model-*.pt", "model-epoch-*.pt"]:
-        model_files.extend(list(results_path.glob(pattern)))
-    
+
+    # model-final.pt is excluded: it marks a completed run, not a resume point
+    model_files = list(results_path.glob("model-epoch-*.pt"))
+    latest = results_path / "model-latest.pt"
+    if latest.exists():
+        model_files.append(latest)
+
     if not model_files:
         return None
-    
-    latest_checkpoint = max(model_files, key=lambda x: x.stat().st_mtime)
-    return latest_checkpoint
+
+    return max(model_files, key=lambda x: x.stat().st_mtime)
 
 
 def main():
@@ -134,20 +135,25 @@ def main():
         print("No checkpoint found. Starting training from scratch.")
     
     print(f"Starting training for {Config.epochs} epochs...")
-    trainer.train(
+    completed = trainer.train(
         epochs=Config.epochs,
         start_epoch=start_epoch,
         val_loader=val_dataloader,
         n_steps = Config.n_steps,
-        save_model_every_epoch=Config.save_model_every_epoch
+        save_model_every_epoch=Config.save_model_every_epoch,
+        max_train_hours=Config.max_train_hours,
+        checkpoint_every_min=Config.checkpoint_every_min,
+        keep_checkpoints=Config.keep_checkpoints
     )
-    
-    trainer.save_model("model-final.pt")
-    
+
     trainer.plot_losses()
     trainer.plot_metrics()
-    
-    print("Training completed!")
+
+    if completed:
+        trainer.save_model("model-final.pt")
+        print("Training completed!")
+    else:
+        print("Training paused by time budget. Rerun train.py in the next GPU session to resume.")
 
 
 if __name__ == "__main__":

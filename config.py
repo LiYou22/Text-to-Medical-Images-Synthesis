@@ -42,6 +42,11 @@ class Config:
     max_samples = None
     save_model_every_epoch = True
 
+    # Time-limited GPU sessions (single 8h A100/H100 allocation)
+    max_train_hours = 7.5      # stop gracefully before the session is killed; None disables
+    checkpoint_every_min = 30  # periodic mid-epoch checkpoint to model-latest.pt
+    keep_checkpoints = 3       # newest per-epoch checkpoints kept on disk
+
 
 def build_model_config(context_dim):
     """Architecture hyperparameters stored in checkpoints so a checkpoint
