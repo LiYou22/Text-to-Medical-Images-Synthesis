@@ -10,18 +10,28 @@ Text-conditional DDPM that generates 256x256 chest X-ray images from radiology r
 
 ## 1. Environment Setup
 
-1. Create a virtual environment
+1. Install [uv](https://docs.astral.sh/uv/) (no root required)
 
     ```
-    conda create -n <env_name> python==3.12
-    conda activate <env_name>
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
     ```
 
-2. Install dependencies
+2. Create a virtual environment and install dependencies
 
-    ```pip install -r requirements.txt```
+    ```
+    uv venv .venv --python 3.12
+    source .venv/bin/activate
+    uv pip install -r requirements.txt
+    ```
 
     `open_clip_torch` is installed from PyPI. The text encoder enables token-level outputs at runtime (`model.text.output_tokens = True`), so no modification of the open_clip source is needed.
+
+3. In every new shell session, activate the environment before running anything:
+
+    ```
+    source .venv/bin/activate
+    ```
 
 ## 2. Dataset Download
   * Access the Indiana University Chest X-ray Collection from [Open-i](https://openi.nlm.nih.gov/faq).
