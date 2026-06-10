@@ -466,9 +466,9 @@ class DiffusionTrainer:
         generated = (generated + 1) / 2
         original  = (original  + 1) / 2 
 
-        # Initialize metrics
-        psnr_metric = PeakSignalNoiseRatio().to(self.device)
-        ssim_metric = StructuralSimilarityIndexMeasure().to(self.device)
+        # Initialize metrics (images normalized to [0, 1] above)
+        psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
+        ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         
         # Move images to compute device
         original = original.to(self.device)
