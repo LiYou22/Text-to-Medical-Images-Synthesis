@@ -12,6 +12,3 @@ einops>=0.8.1
 transformers>=4.51.3
 tensorboard>=2.19.0
 pandas>=2.2.3
-pathlib
-argparse
-typing

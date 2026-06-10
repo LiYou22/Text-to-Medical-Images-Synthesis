@@ -43,7 +43,7 @@
 
 ## 3. Training
 
-1. Navigate to the `train.py` and modify the hyperparameters in the `Config` class based on your settings.
+1. Navigate to `config.py` and modify the hyperparameters in the `Config` class based on your settings (shared by `train.py` and `inference.py`).
 2. Start the training process with the following command
    
    ```python3 train.py```

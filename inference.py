@@ -5,37 +5,10 @@ import argparse
 from pathlib import Path
 import matplotlib.pyplot as plt
 
+from config import Config, build_model_config
 from models.clip_encoder import CLIPEncoder
 from models.conditional_unet import Unet
 from diffusion_trainer import DiffusionTrainer
-
-
-class Config:
-    seed = 42
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # Text encoder
-    model_name = "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-    max_length = 128
-    use_projection = True
-    diffusion_dim = 512
-
-    # UNet
-    channels = 1
-    self_condition=False
-    use_linear_attention=True
-    use_cross_attention=True
-    
-    # Diffusion trainer
-    results_folder = "./results"
-    batch_size = 1
-    timesteps = 1000
-    beta_schedule = "cosine"
-    image_size = 256
-    n_steps = 1000
-    guidance_scale = 3.0
-    scheduler_type = "cosine"
-    scheduler_params = {"T_max": 50, "eta_min": 5e-6}
 
 
 def set_seed(seed):
@@ -113,9 +86,8 @@ def main():
     
     print("Initializing conditional UNet model...")
     unet = Unet(
-        dim=64,
-        init_dim=64,
-        dim_mults=(1, 2, 4, 8),
+        dim=Config.unet_dim,
+        dim_mults=Config.dim_mults,
         channels=Config.channels,
         context_dim=context_dim,
         self_condition=Config.self_condition,
@@ -142,6 +114,15 @@ def main():
     print(f"Loading model from checkpoint: {args.checkpoint}")
     try:
         checkpoint = torch.load(args.checkpoint, map_location=Config.device)
+
+        ckpt_cfg = checkpoint.get('model_config')
+        if ckpt_cfg is not None:
+            current_cfg = build_model_config(context_dim)
+            mismatch = {k: (v, current_cfg.get(k)) for k, v in ckpt_cfg.items() if current_cfg.get(k) != v}
+            if mismatch:
+                print(f"Error: checkpoint architecture does not match current config (checkpoint, current): {mismatch}")
+                return
+
         trainer.model.load_state_dict(checkpoint['model_state_dict'])
         # Sample with EMA weights when available; fall back to the raw model
         trainer.ema_model.load_state_dict(checkpoint.get('ema_state_dict', checkpoint['model_state_dict']))

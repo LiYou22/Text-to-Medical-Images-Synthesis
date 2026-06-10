@@ -4,48 +4,11 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
+from config import Config, build_model_config
 from diffusion_trainer import DiffusionTrainer
 from models.clip_encoder import CLIPEncoder
 from models.conditional_unet import Unet
 from dataset import IUXrayDataset, custom_collate
-
-
-class Config:
-    seed = 42
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    data_dir = "./data/IU-XRay"
-    
-    # Encoder
-    model_name = "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-    max_length = 128
-    use_projection = True
-    diffusion_dim = 512
-    
-    # Unet
-    channels = 1
-    self_condition=False
-    use_linear_attention=True
-    use_cross_attention=True
-    
-    # Diffusion Trainer
-    image_size = 256
-    batch_size = 8
-    epochs = 30
-    lr = 2e-5
-    timesteps = 1000
-    beta_schedule = 'cosine'
-    results_folder = "./results"
-    loss_type = "l2"
-    scheduler_type = "cosine"
-    scheduler_params = {"T_max": 30, "eta_min": 2e-6}
-    n_steps = 1000
-    cond_drop_prob = 0.1
-    ema_decay = 0.9995
-    
-    split_ratio = 0.99
-    max_samples = None
-
-    save_model_every_epoch=True
 
 
 def set_seed(seed):
@@ -127,8 +90,8 @@ def main():
     
     print("Initializing conditional UNet model...")
     unet = Unet(
-        dim=64,
-        dim_mults=(1, 2, 4, 8),
+        dim=Config.unet_dim,
+        dim_mults=Config.dim_mults,
         channels=Config.channels,
         context_dim=context_dim,
         self_condition=Config.self_condition,
@@ -156,7 +119,9 @@ def main():
         scheduler_type=Config.scheduler_type,
         scheduler_params=Config.scheduler_params,
         cond_drop_prob=Config.cond_drop_prob,
-        ema_decay=Config.ema_decay
+        ema_decay=Config.ema_decay,
+        use_amp=Config.use_amp,
+        model_config=build_model_config(context_dim)
     )
 
     start_epoch = 0

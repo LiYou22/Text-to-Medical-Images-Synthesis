@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR
+from torch.utils.tensorboard import SummaryWriter
 from copy import deepcopy
 from pathlib import Path
 from tqdm import tqdm
@@ -89,7 +90,9 @@ class DiffusionTrainer:
         scheduler_type="step",
         scheduler_params = None,
         cond_drop_prob=0.1,
-        ema_decay=0.9995
+        ema_decay=0.9995,
+        use_amp=False,
+        model_config=None
     ):
         self.model = model
         self.dataloader = dataloader
@@ -101,10 +104,16 @@ class DiffusionTrainer:
         self.loss_type = loss_type
         self.cond_drop_prob = cond_drop_prob
         self.ema_decay = ema_decay
+        self.model_config = model_config
 
         # Setup device
         self.device = device if device is not None else "cuda" if torch.cuda.is_available() else "cpu"
         self.model.to(self.device)
+
+        # Mixed precision: bf16 when supported (no scaler needed), else fp16 + GradScaler
+        self.use_amp = use_amp and str(self.device).startswith("cuda")
+        self.amp_dtype = torch.bfloat16 if (self.use_amp and torch.cuda.is_bf16_supported()) else torch.float16
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self.amp_dtype == torch.float16)
 
         if self.text_encoder is not None:
             self.text_encoder.to(self.device)
@@ -125,7 +134,13 @@ class DiffusionTrainer:
         params = list(model.parameters())
         if self.text_encoder is not None and getattr(self.text_encoder, "use_projection", False):
             params += list(self.text_encoder.projection.parameters())
+        self.trainable_params = params
         self.optimizer = AdamW(params, lr=lr, weight_decay=0.01)
+
+        # TensorBoard writer is created lazily in train() so inference-only
+        # usage doesn't create log directories
+        self.writer = None
+        self.global_step = 0
 
         # Set up learning rate scheduler
         if scheduler_type == "step" and scheduler_params != None:
@@ -507,6 +522,9 @@ class DiffusionTrainer:
         }
     
     def train(self, epochs, start_epoch=0, val_loader=None, n_steps=200, save_model_every_epoch=True):
+        if self.writer is None:
+            self.writer = SummaryWriter(log_dir=str(self.results_folder / 'tensorboard'))
+
         for epoch in range(start_epoch, epochs):
             self.model.train()
             epoch_loss = 0.0
@@ -535,16 +553,22 @@ class DiffusionTrainer:
                 # Sample random timesteps
                 t = torch.randint(0, self.timesteps, (batch_size,), device=self.device).long()
 
-                # Compute loss
+                # Compute loss (mixed precision when enabled)
                 self.optimizer.zero_grad()
-                loss = self.p_losses(x, t, context=context)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
-                self.optimizer.step()
+                with torch.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                    loss = self.p_losses(x, t, context=context)
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.trainable_params, 0.5)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
                 self._update_ema()
 
                 epoch_loss += loss.item()
                 batch_count += 1
+                self.global_step += 1
+                if self.writer is not None and self.global_step % 10 == 0:
+                    self.writer.add_scalar('train/step_loss', loss.item(), self.global_step)
 
             # Update learning rate
             self.scheduler.step()
@@ -552,14 +576,25 @@ class DiffusionTrainer:
             # Print average loss
             avg_loss = epoch_loss / batch_count
             print(f"Epoch {epoch+1} average loss: {avg_loss:.6f}, LR: {self.scheduler.get_last_lr()[0]:.6f}")
-            
+
             # Update training history
             self.history["train_losses"].append(avg_loss)
-            
+            self.writer.add_scalar('train/loss', avg_loss, epoch + 1)
+            self.writer.add_scalar('train/lr', self.scheduler.get_last_lr()[0], epoch + 1)
+
             # Validation + visualization (reuse the samples generated during validation)
             if val_loader is not None:
                 val_metrics = self.validate(val_loader, n_steps)
                 print(f"Validation - Loss: {val_metrics['loss']:.6f}, PSNR: {val_metrics['psnr']:.2f}, SSIM: {val_metrics['ssim']:.4f}")
+
+                self.writer.add_scalar('val/loss', val_metrics['loss'], epoch + 1)
+                self.writer.add_scalar('val/psnr', val_metrics['psnr'], epoch + 1)
+                self.writer.add_scalar('val/ssim', val_metrics['ssim'], epoch + 1)
+                self.writer.add_images(
+                    'val/generated',
+                    ((val_metrics['generated'] + 1) / 2).clamp(0, 1),
+                    epoch + 1
+                )
 
                 sample_paths = self.visualize_samples(
                     epoch=epoch+1,
@@ -574,6 +609,8 @@ class DiffusionTrainer:
             # Save model at the end of each epoch
             if save_model_every_epoch:
                 self.save_model(f"model-epoch-{epoch+1}.pt")
+
+        self.writer.flush()
 
     def visualize_samples(self, epoch, real_images, captions, generated=None, batch_size=8, n_steps=1000):
         vis_dir = self.results_folder / 'visualization' / f'epoch-{epoch}'
@@ -636,8 +673,12 @@ class DiffusionTrainer:
             'ema_state_dict': self.ema_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict(),
             'history': self.history
         }
+
+        if self.model_config is not None:
+            save_dict['model_config'] = self.model_config
 
         if self.text_encoder is not None and getattr(self.text_encoder, "use_projection", False):
             save_dict['text_projection_state_dict'] = self.text_encoder.projection.state_dict()
@@ -649,6 +690,14 @@ class DiffusionTrainer:
 
     def load_model(self, checkpoint_path):
         checkpoint = torch.load(str(checkpoint_path))
+
+        ckpt_cfg = checkpoint.get('model_config')
+        if ckpt_cfg is not None and self.model_config is not None:
+            mismatch = {k: (v, self.model_config.get(k)) for k, v in ckpt_cfg.items()
+                        if self.model_config.get(k) != v}
+            if mismatch:
+                raise ValueError(f"Checkpoint architecture does not match current config (checkpoint, current): {mismatch}")
+
         self.model.load_state_dict(checkpoint['model_state_dict'])
         # Older checkpoints have no EMA weights; fall back to the raw model
         self.ema_model.load_state_dict(checkpoint.get('ema_state_dict', checkpoint['model_state_dict']))
@@ -657,6 +706,8 @@ class DiffusionTrainer:
             self.text_encoder.projection.load_state_dict(checkpoint['text_projection_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
         if 'history' in checkpoint:
             self.history = checkpoint['history']
