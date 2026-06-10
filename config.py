@@ -29,17 +29,19 @@ class Config:
 
     # Training
     batch_size = 8
-    epochs = 30
+    epochs = 120
     lr = 2e-5
     loss_type = "l2"
     scheduler_type = "cosine"
-    scheduler_params = {"T_max": 30, "eta_min": 2e-6}
+    scheduler_params = {"T_max": 120, "eta_min": 2e-6}
     cond_drop_prob = 0.1
     ema_decay = 0.9995
     use_amp = True
     results_folder = "./results"
     split_ratio = 0.99
     max_samples = None
+    frontal_only = True   # one (frontal) image per report; lateral views share
+                          # captions that never mention the view
     save_model_every_epoch = True
 
     # Time-limited GPU sessions (single 8h A100/H100 allocation)

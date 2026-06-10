@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import Dataset
 from torchvision import transforms
 import random
+import re
 import xml.etree.ElementTree as ET
 import glob
 import logging
@@ -14,7 +15,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class IUXrayDataset(Dataset):
-    def __init__(self, data_dir, image_size=256, split_ratio=0.9, is_train=True, max_samples=None):
+    def __init__(self, data_dir, image_size=256, split_ratio=0.9, is_train=True, max_samples=None,
+                 frontal_only=True):
         """
         Args:
             data_dir: Root directory containing the dataset
@@ -22,9 +24,12 @@ class IUXrayDataset(Dataset):
             split_ratio: Ratio for train/test split
             is_train: Whether to use train or test split
             max_samples: Maximum number of samples to use (for debugging)
+            frontal_only: Keep only the first parentImage per report (the frontal
+                view in IU-XRay), so captions condition a single view distribution
         """
         self.data_dir = data_dir
         self.is_train = is_train
+        self.frontal_only = frontal_only
         
         self.image_dir = os.path.join(data_dir, 'NLMCXR_png')
         self.report_dir = os.path.join(data_dir, 'ecgen-radiology')
@@ -61,11 +66,23 @@ class IUXrayDataset(Dataset):
                 else:
                     caption = "Chest X-ray."
 
+                # Strip de-identification placeholders (XXXX) and collapse the
+                # whitespace they leave behind
+                caption = re.sub(r'X{2,}', '', caption)
+                caption = re.sub(r'\s+', ' ', caption).strip()
+
                 if len(caption) > 512:
                     caption = caption[:512] + "..."
-                
+
+                parent_images = root.findall('.//parentImage')
+                if self.frontal_only:
+                    # IU-XRay lists the frontal view first; laterals share the
+                    # same caption and would make the conditional distribution
+                    # multimodal (view is not mentioned in the text)
+                    parent_images = parent_images[:1]
+
                 report_samples = []
-                for image in root.findall('.//parentImage'):
+                for image in parent_images:
                     image_id = image.get('id')
                     if image_id:
                         image_path = os.path.join(self.image_dir, f"{image_id}.png")

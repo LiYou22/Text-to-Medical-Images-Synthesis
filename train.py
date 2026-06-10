@@ -44,18 +44,20 @@ def main():
     
     print(f"Loading datasets from {Config.data_dir}...")
     train_dataset = IUXrayDataset(
-        data_dir=Config.data_dir, 
-        image_size=Config.image_size, 
-        split_ratio=Config.split_ratio, 
+        data_dir=Config.data_dir,
+        image_size=Config.image_size,
+        split_ratio=Config.split_ratio,
         is_train=True,
-        max_samples=Config.max_samples
+        max_samples=Config.max_samples,
+        frontal_only=Config.frontal_only
     )
     val_dataset = IUXrayDataset(
-        data_dir=Config.data_dir, 
-        image_size=Config.image_size, 
-        split_ratio=Config.split_ratio, 
+        data_dir=Config.data_dir,
+        image_size=Config.image_size,
+        split_ratio=Config.split_ratio,
         is_train=False,
-        max_samples=Config.max_samples
+        max_samples=Config.max_samples,
+        frontal_only=Config.frontal_only
     )
     
     print(f"Train dataset size: {len(train_dataset)}")
