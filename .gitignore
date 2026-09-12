@@ -184,3 +184,5 @@ results-2/
 doc/
 logs/
 
+# MacOS
+.DS_Store
