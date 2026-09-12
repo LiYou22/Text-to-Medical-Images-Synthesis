@@ -38,7 +38,8 @@ class Config:
     ema_decay = 0.9995
     use_amp = True
     results_folder = "./results"
-    split_ratio = 0.99
+    split_ratio = 0.9    # ~10% of reports held out; a 1% val set has too few
+                         # unique captions for a meaningful conditional FID
     max_samples = None
     frontal_only = True   # one (frontal) image per report; lateral views share
                           # captions that never mention the view

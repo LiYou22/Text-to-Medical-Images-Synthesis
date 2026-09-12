@@ -13,3 +13,5 @@ open_clip_torch>=2.24.0
 transformers>=4.51.3
 tensorboard>=2.19.0
 pandas>=2.2.3
+torch-fidelity>=0.3.0
+

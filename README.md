@@ -77,3 +77,32 @@ python inference.py --checkpoint </path/to/checkpoint.pt> \
 * Sampling uses EMA weights when present in the checkpoint.
 
 > **Note on old pretrained weights**: checkpoints trained before the conditioning/sampling overhaul (e.g., the previously linked Google Drive weights) are incompatible with the current code — they lack the trained text projection and EMA weights, so generations will not be meaningful. Retrain to produce usable checkpoints.
+
+## 5. Evaluation (FID / KID)
+
+Per-epoch PSNR/SSIM only tracks a rough trend: generated samples are not pixel-aligned
+with ground truth, and SSIM saturates within a few epochs. Distribution metrics are the
+real measure of sample quality.
+
+```
+python evaluate.py --checkpoint </path/to/checkpoint.pt> \
+    --n-samples <n> \
+    --batch-size <batch_size> \
+    --n-steps <n_steps> \
+    --guidance-scale <scale> \
+    --reference-split {train,val,all} \
+    --caption-split {train,val,all} \
+    --feature {64,192,768,2048}
+```
+
+Samples `--n-samples` images conditioned on captions from `--caption-split` (default
+`val`, i.e. unseen reports) and compares them against the real images in
+`--reference-split` (default `all`, for the largest possible reference). Prints FID and
+KID (mean ± std) and writes them with the full run configuration to
+`results/eval_fid_kid.json`.
+
+* `--split-ratio` must match the value used at training time, or `val` is not actually held out.
+* `--feature 768` is less biased than the default 2048 when the reference set is small.
+* KID's subset size is clamped to the smaller of the two distributions; it is more
+  reliable than FID at this dataset's scale (~3.8k frontal images).
+* Sampling dominates the runtime: `n_samples × n_steps` UNet forward passes.
