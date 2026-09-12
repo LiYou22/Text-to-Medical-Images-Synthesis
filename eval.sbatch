@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 source .venv/bin/activate
 
-CKPT="${1:-results/model-final.pt}"
+CKPT="${1:-results/checkpoints/model-final.pt}"
 N_SAMPLES="${2:-1000}"
 
 nvidia-smi
