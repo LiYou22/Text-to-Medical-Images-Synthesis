@@ -76,8 +76,6 @@ python inference.py --checkpoint </path/to/checkpoint.pt> \
 * `--guidance_scale` controls classifier-free guidance strength (default 3.0; 1.0 disables guidance).
 * Sampling uses EMA weights when present in the checkpoint.
 
-> **Note on old pretrained weights**: checkpoints trained before the conditioning/sampling overhaul (e.g., the previously linked Google Drive weights) are incompatible with the current code — they lack the trained text projection and EMA weights, so generations will not be meaningful. Retrain to produce usable checkpoints.
-
 ## 5. Evaluation (FID / KID)
 
 Per-epoch PSNR/SSIM only tracks a rough trend: generated samples are not pixel-aligned
