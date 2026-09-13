@@ -29,19 +29,20 @@ unconditional branch to interpolate against at inference time.
 
 ### Distribution Metrics
 
-| Inception features | FID | KID |
-|---|---:|---:|
-| **2048 (standard)** | **32.99** | **0.02542 ± 0.00413** |
+| Metric | Value |
+|---|---:|
+| **FID** | **32.99** |
+| **KID** | **0.02542 ± 0.00413** |
+| SSIM | 0.6081 |
+| PSNR | 13.93 dB |
 
-Evaluation uses **2,000 generated samples** conditioned on held-out report text and **3,851 real frontal X-rays**, with **DDIM 250 steps**, **guidance scale 3.0**, and **EMA weights**. Full configuration is saved in `results/eval_fid_kid.json`.
+Evaluation uses **2,000 generated samples** conditioned on held-out report text and **3,851 real frontal X-rays**, with standard **2048-d Inception features**, **DDIM 250 steps**, **guidance scale 3.0**, and **EMA weights**. Full configuration is saved in `results/eval_fid_kid.json`.
 
-> **Important:** FID values are only comparable when computed from the same Inception feature layer. All values reported here use the standard final **2048-d pooling layer**. Scores taken from earlier layers fall on a completely different scale and must never be compared against 2048-d numbers.
+FID and KID are the primary metrics. SSIM and PSNR are reported at epoch 120 for completeness and vary substantially between epochs — see [Why PSNR / SSIM Are Secondary](#why-psnr--ssim-are-secondary).
 
 ### Comparison with Published Results
 
 Published IU-XRay results include **Diff-CXR (31.46)**, **LLM-CXR (41.29)**, and **RoentGen (73.32)**. These models were trained on **MIMIC-CXR (~377K images)** and evaluated zero-shot on IU-XRay, while this model was trained directly on IU-XRay and evaluated against a reference set that includes its training distribution.
-
-Therefore, **FID 32.99 should not be interpreted as direct parity with Diff-CXR**. It is a result for this specific training and evaluation setup.
 
 ---
 
