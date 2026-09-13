@@ -119,8 +119,13 @@ def main():
                         help="Captions the samples are conditioned on; val keeps them unseen.")
     parser.add_argument("--split-ratio", type=float, default=Config.split_ratio,
                         help="Must match the value used at training time, or 'val' is not held out.")
-    parser.add_argument("--feature", type=int, default=2048, choices=[64, 192, 768, 2048],
-                        help="Inception feature dim. 768 is less biased when reals are scarce.")
+    parser.add_argument("--features", type=int, nargs="+", default=[2048, 768],
+                        choices=[64, 192, 768, 2048],
+                        help="Inception feature dims to score at. 2048 is the standard FID "
+                             "reported in the literature; smaller dims are NOT comparable to it.")
+    parser.add_argument("--save-samples", type=str, default=None,
+                        help="Directory to save generated images, so metrics can be recomputed "
+                             "at other feature dims without re-sampling.")
     parser.add_argument("--kid-subset-size", type=int, default=100)
     parser.add_argument("--no-ema", action="store_true", help="Sample from the raw weights instead of EMA.")
     parser.add_argument("--seed", type=int, default=Config.seed)
@@ -140,9 +145,10 @@ def main():
     n_real = len(reference)
     n_unique_captions = len(set(caption_pool))
     print(f"Reference reals: {n_real} | caption pool: {len(caption_pool)} ({n_unique_captions} unique)")
-    if n_real < args.feature:
-        print(f"Warning: {n_real} reals with feature={args.feature} makes FID severely biased; "
-              f"use --feature 768 or a larger --reference-split.")
+    for f in args.features:
+        if n_real < f:
+            print(f"Warning: {n_real} reals with feature={f} makes FID severely biased; "
+                  f"use a larger --reference-split.")
     if n_unique_captions < 100:
         print(f"Warning: only {n_unique_captions} unique captions; FID will partly measure "
               f"noise diversity rather than conditional coverage.")
@@ -150,16 +156,19 @@ def main():
     # KID draws subsets from both distributions, so it cannot exceed either side
     kid_subset = min(args.kid_subset_size, args.n_samples, n_real)
 
-    fid = FrechetInceptionDistance(feature=args.feature, normalize=True).to(device)
-    kid = KernelInceptionDistance(feature=args.feature, subset_size=kid_subset,
-                                  normalize=True).to(device)
+    metrics = {
+        f: (FrechetInceptionDistance(feature=f, normalize=True).to(device),
+            KernelInceptionDistance(feature=f, subset_size=kid_subset, normalize=True).to(device))
+        for f in args.features
+    }
 
     real_loader = DataLoader(reference, batch_size=args.batch_size, shuffle=False,
                              collate_fn=custom_collate, num_workers=2)
     for batch in tqdm(real_loader, desc="Real features"):
         x = to_inception_input(batch["pixel_values"].to(device))
-        fid.update(x, real=True)
-        kid.update(x, real=True)
+        for fid, kid in metrics.values():
+            fid.update(x, real=True)
+            kid.update(x, real=True)
 
     # Cycle the caption pool with a fixed shuffle so every caption is used a
     # comparable number of times when n_samples exceeds the pool.
@@ -167,6 +176,10 @@ def main():
     captions = caption_pool[:]
     rng.shuffle(captions)
     captions = [captions[i % len(captions)] for i in range(args.n_samples)]
+
+    sample_dir = Path(args.save_samples) if args.save_samples else None
+    if sample_dir:
+        sample_dir.mkdir(parents=True, exist_ok=True)
 
     generated = 0
     with tqdm(total=args.n_samples, desc="Sampling") as bar:
@@ -180,20 +193,26 @@ def main():
                 use_ema=not args.no_ema,
                 show_progress=False,
             )
+            if sample_dir:
+                torch.save({"samples": samples.cpu(), "captions": chunk},
+                           sample_dir / f"batch-{generated:06d}.pt")
             x = to_inception_input(samples.to(device))
-            fid.update(x, real=False)
-            kid.update(x, real=False)
+            for fid, kid in metrics.values():
+                fid.update(x, real=False)
+                kid.update(x, real=False)
             generated += len(chunk)
             bar.update(len(chunk))
 
-    fid_value = fid.compute().item()
-    kid_mean, kid_std = kid.compute()
+    scores = {}
+    for f, (fid, kid) in metrics.items():
+        kid_mean, kid_std = kid.compute()
+        scores[str(f)] = {"fid": fid.compute().item(),
+                          "kid_mean": kid_mean.item(),
+                          "kid_std": kid_std.item()}
 
     results = {
         "checkpoint": args.checkpoint,
-        "fid": fid_value,
-        "kid_mean": kid_mean.item(),
-        "kid_std": kid_std.item(),
+        "scores": scores,
         "n_generated": args.n_samples,
         "n_real": n_real,
         "n_unique_captions": n_unique_captions,
@@ -202,14 +221,18 @@ def main():
         "split_ratio": args.split_ratio,
         "n_steps": args.n_steps,
         "guidance_scale": args.guidance_scale,
-        "feature": args.feature,
+        "features": args.features,
         "kid_subset_size": kid_subset,
         "ema": not args.no_ema,
         "seed": args.seed,
     }
 
-    print(f"\nFID  {fid_value:.2f}")
-    print(f"KID  {kid_mean.item():.4f} +/- {kid_std.item():.4f}")
+    print()
+    for f in args.features:
+        sc = scores[str(f)]
+        std = "  (feature=2048 is the standard, literature-comparable FID)" if f == 2048 else ""
+        print(f"feature={f:<5} FID {sc['fid']:8.2f}   "
+              f"KID {sc['kid_mean']:.5f} +/- {sc['kid_std']:.5f}{std}")
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

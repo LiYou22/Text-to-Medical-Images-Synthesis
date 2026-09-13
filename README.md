@@ -90,7 +90,8 @@ python evaluate.py --checkpoint </path/to/checkpoint.pt> \
     --guidance-scale <scale> \
     --reference-split {train,val,all} \
     --caption-split {train,val,all} \
-    --feature {64,192,768,2048}
+    --features 2048 768 \
+    --save-samples results/eval-samples
 ```
 
 Samples `--n-samples` images conditioned on captions from `--caption-split` (default
@@ -100,7 +101,15 @@ KID (mean ± std) and writes them with the full run configuration to
 `results/eval_fid_kid.json`.
 
 * `--split-ratio` must match the value used at training time, or `val` is not actually held out.
-* `--feature 768` is less biased than the default 2048 when the reference set is small.
+* `--features` scores at several Inception feature dims in one sampling pass. **2048 is the
+  standard FID reported in the literature; smaller dims are on a completely different scale
+  and are not comparable to it** (on the same images, 2048 gave FID 81.8 where 768 gave 0.49).
+  Smaller dims are only useful as a relative signal when the reference set is tiny.
+* `--save-samples` caches the generated images so metrics can be recomputed at other feature
+  dims without repeating the sampling pass, which dominates the runtime.
+* `--n-samples` should be at least the largest feature dim, or the covariance FID estimates is
+  rank-deficient. The default job uses 2000 against a 3,851-image reference set; report that as
+  FID-2k rather than comparing it to FID-50k numbers.
 * KID's subset size is clamped to the smaller of the two distributions; it is more
   reliable than FID at this dataset's scale (~3.8k frontal images).
 * Sampling dominates the runtime: `n_samples × n_steps` UNet forward passes.
