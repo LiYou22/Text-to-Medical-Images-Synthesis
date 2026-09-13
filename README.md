@@ -58,11 +58,16 @@ learned distribution.
 
 ### Ground truth vs. generated
 
+Selected from the epoch-120 validation batch. Each pair shares a report; the model
+never sees the ground-truth image.
+
 ![sample 1](assets/samples/sample-1.png)
 
 ![sample 2](assets/samples/sample-2.png)
 
-Each pair shares a report; the model never sees the ground-truth image.
+Quality is uneven across samples — the failure mode is a globally plausible but
+anatomically incoherent film, and it is more frequent for rare pathological reports
+than for normal ones. See *Known limitations*.
 
 ### Training
 
@@ -107,7 +112,8 @@ are reported for transparency only.
   not the implementation; the standard fix is fine-tuning a pretrained latent
   diffusion model rather than training from scratch.
 - Pathological captions are sparse in IU-XRay, so the conditional distribution's tail
-  is not learned.
+  is not learned. Sample quality tracks caption frequency: normal findings render as
+  well-formed frontal films, rare pathological descriptions often degrade.
 - No radiological validation of any kind. Generated images are for research only and
   must not be used diagnostically.
 
