@@ -6,6 +6,33 @@ A text-conditioned diffusion model that generates 256×256 chest X-rays from rad
 
 ![model architecture](assets/model-arch.png)
 
+## Metrics
+
+| Metric | Value |
+|---|---:|
+| FID | 32.99 |
+| KID | 0.02542 ± 0.00413 |
+| SSIM | 0.6081 |
+| PSNR | 13.93 dB |
+
+FID / KID: 2,000 samples conditioned on held-out report text vs. 3,851 real frontal X-rays,
+2048-d Inception features, DDIM 250 steps, guidance scale 3.0, EMA weights.
+
+Training and validation loss:
+
+![loss](assets/loss.png)
+
+PSNR and SSIM per epoch, on a fixed 8-image validation batch:
+
+![pixel metrics](assets/pixel_metrics.png)
+
+## Ground Truth vs. Generated
+
+Each generated image is conditioned on the report of its paired ground-truth image (epoch-120
+validation batch).
+
+![sample](assets/samples/sample-1.png)
+
 ## Reproduce
 
 ### 1. Environment
